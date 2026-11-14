@@ -1,0 +1,85 @@
+name: mini-object-store
+x-worker: &worker
+  build: .
+  image: mini-object-store:local
+  restart: unless-stopped
+  depends_on:
+    controller:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: store
+      POSTGRES_PASSWORD: store
+      POSTGRES_DB: store
+    volumes:
+      - metadata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U store -d store"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  controller:
+    build: .
+    image: mini-object-store:local
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn object_store.controller:create_app --factory --host 0.0.0.0 --port 8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://store:store@postgres/store
+      WORKER_TIMEOUT: "10"
+      REPAIR_INTERVAL: "3"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - spool:/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  worker1:
+    <<: *worker
+    container_name: worker1
+    environment:
+      WORKER_ID: worker1
+    volumes:
+      - worker1:/data
+  worker2:
+    <<: *worker
+    container_name: worker2
+    environment:
+      WORKER_ID: worker2
+    volumes:
+      - worker2:/data
+  worker3:
+    <<: *worker
+    container_name: worker3
+    environment:
+      WORKER_ID: worker3
+    volumes:
+      - worker3:/data
+  worker4:
+    <<: *worker
+    container_name: worker4
+    environment:
+      WORKER_ID: worker4
+    volumes:
+      - worker4:/data
+volumes:
+  metadata:
+  spool:
+  worker1:
+  worker2:
+  worker3:
+  worker4:

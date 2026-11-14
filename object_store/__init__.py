@@ -1,0 +1,1 @@
+"""Mini distributed object store."""
