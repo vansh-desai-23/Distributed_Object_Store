@@ -12,8 +12,7 @@ async def test_returning_heartbeat_invalidates_stale_replica_health(cluster):
     worker = meta['chunks'][0]['replicas'][0]['worker_id']
     cluster.stop(worker)
     cluster.offline.remove(worker)
-    response = await cluster.client.post('/internal/workers/heartbeat', json={
-        'worker_id': worker, 'url': f'http://{worker}:8000', 'free_bytes': 10**9})
+    response = await cluster.client.post('/internal/workers/heartbeat', json=cluster.report(worker))
     assert response.status_code == 200
     with cluster.store.sessions() as session:
         assert session.get(Replica, (meta['chunks'][0]['chunk_id'], worker)).state == 'pending'
@@ -40,8 +39,7 @@ async def test_network_failure_is_not_reported_as_corruption(cluster, monkeypatc
 async def test_regular_heartbeat_preserves_validated_replicas(cluster):
     meta = (await cluster.upload()).json()
     worker = meta['chunks'][0]['replicas'][0]['worker_id']
-    response = await cluster.client.post('/internal/workers/heartbeat', json={
-        'worker_id': worker, 'url': f'http://{worker}:8000', 'free_bytes': 10**9})
+    response = await cluster.client.post('/internal/workers/heartbeat', json=cluster.report(worker))
     assert response.status_code == 200
     with cluster.store.sessions() as session:
         assert session.get(Replica, (meta['chunks'][0]['chunk_id'], worker)).state == 'healthy'
@@ -108,6 +106,7 @@ async def test_returning_worker_missing_disk_copy_is_repaired(cluster):
     await cluster.register(worker)
     with cluster.store.sessions() as session:
         stored = session.get(Chunk, chunk['chunk_id'])
+    await cluster.store.registry.reconcile()
     # Not in the scrub batch: pending return still forces validation immediately.
     await cluster.store.repair(stored, scrub=False)
     replicas = cluster.store.metadata(meta['object_id'])['chunks'][0]['replicas']

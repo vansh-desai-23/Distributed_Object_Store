@@ -112,3 +112,9 @@ Deliver `dist/mini-distributed-object-store.zip`. Regenerate the ZIP after any s
 ## Known limits
 
 One controller process and one metadata database remain availability dependencies. Per-object locks can delay deletion/repair behind active downloads. Metadata transactions are synchronous and intended for a small local workload. No authentication/TLS, backup service, resumable transfer, range requests, versioning or multi-host failure guarantee is included. Permanent deletion markers and in-memory lock entries are retained. Client POST retries can create a second complete object after an ambiguous response. The optional frontend is deferred; no claim of production readiness is made.
+
+## Reliability upgrades after the original submission baseline
+
+Upgrade Phases 1–2 add persistent storage/boot identity, inventory-gated readiness, local SQLite catalogs, ordered mutation receipts, persisted worker scan progress, acknowledged damage reports and a durable serial repair queue. PostgreSQL remains the controller database; no containers were added. `scripts/check_integrity.py` now proves worker-local report retention with the controller paused, including catalog rejection of consistently altered bytes/manifest. Status exposes progress and pending repairs. See design.md for protocol/recovery details and validation.md for current evidence.
+
+The existing dist archive predates these upgrades. The operational CLI, expanded boundary matrix and refreshed archive are upgrade Phase 3; regenerate the archive only after final validation.

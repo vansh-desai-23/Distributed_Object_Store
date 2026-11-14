@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+import sqlite3
 from sqlalchemy.exc import SQLAlchemyError
 
 CHUNK_SIZE = 1_000_000
@@ -69,6 +70,7 @@ def install_errors(app: FastAPI) -> None:
         log.exception("Database operation failed")
         return JSONResponse({"error": {"message": "Metadata service unavailable"}}, status_code=503)
 
+    @app.exception_handler(sqlite3.Error)
     @app.exception_handler(OSError)
     async def storage_error(request, exc):
         log.exception("Local storage operation failed")

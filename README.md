@@ -4,7 +4,7 @@ Python REST backend for one controller and four persistent storage workers, usin
 
 ## Submission guide
 
-See [docs/submission.md](docs/submission.md) for the presentation sequence, requirement-to-evidence mapping, fresh-deployment verification, packaging instructions and known limitations. The required backend covers Phases 1–7; the optional custom frontend remains deferred.
+See [docs/submission.md](docs/submission.md) for the presentation sequence, requirement-to-evidence mapping, fresh-deployment verification, packaging instructions and known limitations. The required backend covers original Phases 1–7; the optional custom frontend remains deferred. Reliability upgrade Phases 1–2 (safe membership, local integrity and durable repair) are implemented. Upgrade Phase 3 (operational CLI, expanded boundaries and final packaging) remains planned. Existing archives in `dist/` must be rebuilt to include current source changes.
 
 To create the source submission archive after validation:
 
@@ -70,7 +70,9 @@ Final deletion writes a small persistent `.deleted` marker on every registered w
 
 The live check uses 10 MB by default and runs two successive worker stop/start cycles. It checks downloads immediately after stopping a worker, heartbeat expiry, automatic restoration of two live replicas, independent on-disk checksum verification, and reconciliation to exactly two copies when the worker returns. It restores stopped workers and deletes only its own test object. Run separately from other fault demonstrations; worker stops temporarily affect the whole local cluster.
 
-A worker explicitly registers on startup. A return after heartbeat expiry (or explicit re-registration) makes old healthy replicas pending until verified, rather than treating a heartbeat as proof that data survived. Network/server errors mean unverified availability; missing or checksum-invalid data is marked bad. Repair waits and retries when no valid source or suitable destination is available.
+A worker persists a storage UUID in `worker.identity` and generates a fresh boot UUID at startup. It explicitly registers before sending heartbeats. A return after heartbeat expiry (or explicit re-registration) makes old healthy replicas pending until verified, rather than treating a heartbeat as proof that data survived. Returning workers are excluded from reads and placements until controller-driven inventory reconciliation completes. `/api/v1/status` exposes storage/boot IDs and membership state; worker `/ready` returns 503 until the controller confirms eligibility, and Compose uses it for worker health checks. Inventories never replace controller hashes; unknown chunk UUIDs are permanently cleaned up. A changed storage volume under the same service name is rejected: restore the original volume rather than silently adopting its replacement.
+
+Network/server errors mean unverified availability; missing or checksum-invalid data is marked bad. Repair waits and retries when no valid source or suitable destination is available.
 
 ## Phase 6 integrity acceptance
 
@@ -81,7 +83,7 @@ A worker explicitly registers on startup. A return after heartbeat expiry (or ex
 .venv/bin/python scripts/check_integrity.py --size-mb 100
 ```
 
-The live check uses 10 MB by default. It corrupts bytes, damages a checksum manifest, and alters both bytes and their worker-local checksum in its own test object. The controller is briefly paused during each injection so the script can capture the worker response before repair runs, then immediately resumed. It checks full download hashes and exactly two repaired copies on disk; the manifest case relies on background scrubbing without triggering a download first. Run when no other work is using the local controller. The script restores the controller and deletes its own object in finally blocks.
+The live check uses 10 MB by default. It corrupts bytes, damages a checksum manifest, and alters both bytes and their worker-local checksum in its own test object. The controller is briefly paused during each injection so the script can capture the worker response before repair runs, then immediately resumed. It checks full download hashes and exactly two repaired copies on disk; the manifest case proves that a worker-local scan retains a damage report while the controller is paused, then verifies automatic repair without a download trigger. The trusted catalog rejects consistently altered bytes and manifests as well. Run when no other work is using the local controller. The script restores the controller and deletes its own object in finally blocks.
 
 Workers validate manifest structure, an integer size within 1..1,000,000 bytes, and a 64-character SHA-256 value, reading at most 4,097 manifest bytes to enforce a 4,096-byte limit. The controller independently compares chunk bytes with its PostgreSQL checksum; a locally consistent but altered worker file is still rejected. If every copy is invalid, the system preserves the records and fails rather than propagating corrupt data. Checksums detect accidental corruption; they are not authentication against an attacker who can modify controller metadata too.
 
@@ -155,3 +157,16 @@ See [design.md](docs/design.md) for Phase 1 decisions, schema, complete REST con
 - Downloads already in progress hold an object lock; deletion waits for those downloads before committing logical removal.
 - PostgreSQL owns metadata; persistent filesystem volumes own binary data. No Kafka, gRPC, Kubernetes, or leader election is needed for this topology.
 - Authentication, TLS, high availability of the controller/database, backups, and resumable transfers are outside this local coursework implementation. The optional frontend remains deferred.
+
+## Durable integrity and repair (reliability upgrade Phase 2)
+
+Workers use Python's built-in SQLite module for a small `catalog.sqlite` file inside their existing data volume. PostgreSQL remains the controller database, and the deployment still has six containers. This adds durable local metadata, not another database service.
+
+- A fixed-order local scan checks up to 16 cataloged chunks per pass (default every 3 seconds). Its cursor, cycle ceiling, completed-cycle count and checked count survive restart. Checks use trusted expected size/hash from PUT or controller reconciliation, never a recomputed replacement hash.
+- Damage reports have durable event IDs and repeat in heartbeats until acknowledged. The controller commits deduplication and repair intent before acknowledgment; an old report cannot invalidate a newer replacement operation.
+- The controller coalesces read failures, availability changes, inventory findings and damage reports into one persistent repair job per chunk. One serial loop handles up to 32 jobs per pass, verifies replacement bytes and checks current object/repair intent before publication. Unresolved jobs retain attempts/error details and retry.
+- Mutations carry a durable increasing operation sequence. Workers record the sequence and intent before changing files, retain completion receipts, reject stale/conflicting requests, and recover interrupted publication/deletion on startup. Permanent deletion markers still forbid resurrection at any sequence.
+
+`GET /api/v1/status` includes each worker's last reported `scan_progress` and up to 100 pending `repair_jobs` (reason, revision, attempts and last error). Worker `GET /internal/scan` exposes local progress and up to 100 unacknowledged reports on the internal network. These are inspection APIs; the general operational CLI is Phase 3.
+
+Catalogs, operation high-water marks, deduplication receipts and permanent deletion markers are retained rather than garbage-collected. Back up controller metadata and worker volumes together; restoring an older controller database against newer worker sequence records is not supported. The system continues to require one controller process and one worker process per volume.

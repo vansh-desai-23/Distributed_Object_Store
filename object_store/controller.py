@@ -12,13 +12,15 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select, text, update
+from uuid import UUID
+from sqlalchemy import select, text
 from starlette.datastructures import UploadFile
 
 from object_store.common import canonical_id, install_errors, validate_metadata
 from object_store.database import make_database
-from object_store.models import Chunk, Replica, StoredObject, Worker, now
+from object_store.models import Chunk, StoredObject, Worker, RepairJob, now
 from object_store.service import Store
+from object_store.membership import Registry
 
 log = logging.getLogger(__name__)
 
@@ -40,10 +42,29 @@ class UploadBudget:
             await self.app(scope, checked_receive, send)
 
 
+class DamageReport(BaseModel):
+    event_id: UUID
+    chunk_id: UUID
+    sequence: int = Field(ge=0)
+    reason: str = Field(max_length=64)
+
+
+class ScanProgress(BaseModel):
+    cursor: str = Field(default='', max_length=36)
+    ceiling: str = Field(default='', max_length=36)
+    cycles: int = Field(default=0, ge=0)
+    checked: int = Field(default=0, ge=0)
+    pending_damage: int = Field(default=0, ge=0)
+
+
 class WorkerReport(BaseModel):
     worker_id: str = Field(min_length=1, max_length=64)
     url: str = Field(max_length=255)
     free_bytes: int = Field(ge=0)
+    storage_id: UUID
+    boot_id: UUID
+    damage_reports: list[DamageReport] = Field(default_factory=list, max_length=100)
+    scan_progress: ScanProgress | None = None
 
 
 def create_app(database_url=None, transport=None, background=True, allowed_workers=None):
@@ -51,6 +72,7 @@ def create_app(database_url=None, transport=None, background=True, allowed_worke
     client = httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(5, connect=2),
                               limits=httpx.Limits(max_connections=16), trust_env=False)
     store = Store(sessions, client, float(os.environ.get("WORKER_TIMEOUT", "10")))
+    store.registry = Registry(store)
     allowed = allowed_workers or {f"worker{i}": f"http://worker{i}:8000" for i in range(1, 5)}
 
     async def maintain():
@@ -89,28 +111,21 @@ def create_app(database_url=None, transport=None, background=True, allowed_worke
     async def register(report: WorkerReport, request: Request):
         if allowed.get(report.worker_id) != report.url:
             raise HTTPException(400, "Worker identity and URL must match configured membership")
-        with sessions.begin() as session:
-            worker = session.get(Worker, report.worker_id)
-            if worker is None:
-                if request.url.path.endswith("heartbeat"):
-                    raise HTTPException(404, "Worker must register first")
-                worker = Worker(id=report.worker_id, url=report.url)
-                session.add(worker)
-            elif request.url.path.endswith("register") or not store.live(worker):
-                # Heartbeats prove process reachability, not that old disk copies survived.
-                session.execute(update(Replica).where(Replica.worker_id == worker.id,
-                    Replica.state == "healthy").values(state="pending"))
-            worker.last_seen = now()
-            worker.free_bytes = report.free_bytes
-        return {"worker_id": report.worker_id, "status": "registered"}
+        return await store.registry.report(report.model_dump(mode="json"),
+                                           request.url.path.endswith("register"))
 
     @app.get("/api/v1/status")
     async def status():
         with sessions() as session:
             workers = [{"worker_id": w.id, "available": store.live(w), "last_seen": w.last_seen.isoformat(),
-                        "free_bytes": w.free_bytes} for w in session.scalars(select(Worker).order_by(Worker.id))]
+                        "free_bytes": w.free_bytes, "storage_id": w.storage_id, "boot_id": w.boot_id,
+                        "scan_progress": w.scan_progress, "eligible": w.eligible, "membership_state": "ready" if w.eligible else "reconciling"} for w in session.scalars(select(Worker).order_by(Worker.id))]
             pending = len(session.scalars(select(StoredObject.id).where(StoredObject.state == "deleting")).all())
-        return {"workers": workers, "pending_cleanup_objects": pending, "replication_factor": 2}
+            jobs = [{"chunk_id": j.chunk_id, "revision": j.revision, "reason": j.reason,
+                     "attempts": j.attempts, "last_error": j.last_error}
+                    for j in session.scalars(select(RepairJob).order_by(RepairJob.updated_at).limit(100))]
+        return {"workers": workers, "pending_cleanup_objects": pending, "replication_factor": 2,
+                "repair_jobs": jobs}
 
     @app.post("/api/v1/objects", status_code=201, openapi_extra={
         "requestBody": {"required": True, "content": {"multipart/form-data": {"schema": {

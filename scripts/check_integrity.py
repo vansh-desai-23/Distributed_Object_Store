@@ -93,12 +93,17 @@ except urllib.error.HTTPError as exc:
 '''
                     proof = json.loads(docker('exec', worker, 'python', '-c', code, chunk['chunk_id'], mode))
                     if mode == 'consistent':
-                        require(proof['status'] == 200 and proof['checksum'] != chunk['checksum'],
-                                'Failed to create self-consistent but incorrect worker data')
-                        print('PASS: worker accepts altered bytes/manifest; authoritative checksum differs', flush=True)
+                        require(proof['status'] == 409, 'Durable expected hash failed to detect altered bytes/manifest')
+                        print('PASS: trusted worker catalog rejects consistently altered bytes/manifest', flush=True)
                     else:
                         require(proof['status'] == 409, 'Worker failed to detect injected corruption')
                         print(f'PASS: worker detected {mode} corruption with 409', flush=True)
+                    if mode == 'manifest':
+                        def reported():
+                            code = "import json,urllib.request; print(urllib.request.urlopen('http://localhost:8000/internal/scan').read().decode())"
+                            report = json.loads(docker('exec', worker, 'python', '-c', code))
+                            return any(e['chunk_id'] == chunk['chunk_id'] for e in report['damage_reports'])
+                        wait_for(reported, 'worker-local scan retained damage while controller was paused')
                 finally:
                     docker('compose', 'unpause', 'controller')
                     paused = False

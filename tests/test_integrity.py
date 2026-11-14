@@ -67,7 +67,8 @@ async def test_controller_hash_rejects_consistently_altered_worker_copy(cluster)
     altered = b'evil data'
     disk.path(chunk['chunk_id']).write_bytes(altered)
     disk.path(chunk['chunk_id']).with_suffix('.json').write_text(json.dumps({'size': len(altered), 'checksum': checksum(altered)}))
-    assert disk.get(chunk['chunk_id']) == altered  # Locally self-consistent, but not authoritative.
+    with pytest.raises(HTTPException):
+        disk.get(chunk['chunk_id'])  # The durable catalog also rejects the altered manifest.
     response = await cluster.client.get(f"/api/v1/objects/{meta['object_id']}")
     assert response.status_code == 200 and response.content == data
     with cluster.store.sessions() as session:
@@ -83,8 +84,14 @@ async def test_rotating_scrub_finds_corruption_without_download(cluster):
     chunk = chunks[-1]  # Beyond the first 16-record scrub batch.
     target = chunk['replicas'][0]['worker_id']
     cluster.workers[target].state.disk.path(chunk['chunk_id']).write_bytes(b'broken')
-    await cluster.store.maintenance()
-    await cluster.store.maintenance()
+    for _ in range(2):
+        for worker, app in cluster.workers.items():
+            app.state.disk.scan_batch()
+            reply = await cluster.client.post('/internal/workers/heartbeat', json={
+                **cluster.report(worker), **app.state.disk.catalog.report()})
+            assert reply.status_code == 200
+            app.state.disk.catalog.acknowledge(reply.json()['acknowledged_damage'])
+        await cluster.store.maintenance()
     current = next(c for c in cluster.store.metadata(meta['object_id'])['chunks'] if c['chunk_id'] == chunk['chunk_id'])
     assert len(current['replicas']) == 2
     for replica in current['replicas']:

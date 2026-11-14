@@ -32,9 +32,12 @@ class Cluster:
             raise httpx.ReadError("Lost acknowledgment", request=request)
         return response
 
+    def report(self, worker):
+        return {"worker_id": worker, "url": f"http://{worker}:8000", "free_bytes": 10**10,
+                **self.workers[worker].state.membership}
+
     async def register(self, worker):
-        response = await self.client.post("/internal/workers/register", json={
-            "worker_id": worker, "url": f"http://{worker}:8000", "free_bytes": 10**10})
+        response = await self.client.post("/internal/workers/register", json=self.report(worker))
         assert response.status_code == 200
 
     def stop(self, worker):
@@ -55,4 +58,5 @@ async def cluster(tmp_path):
         await stack.enter_async_context(cluster.client)
         for worker in cluster.workers:
             await cluster.register(worker)
+        await cluster.store.registry.reconcile()
         yield cluster

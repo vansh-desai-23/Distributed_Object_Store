@@ -211,7 +211,7 @@ async def test_full_worker_disks_fail_cleanly(cluster, monkeypatch):
 
 async def test_worker_registration_rejects_arbitrary_url(cluster):
     response = await cluster.client.post('/internal/workers/register', json={
-        'worker_id': 'worker1', 'url': 'http://unexpected-host', 'free_bytes': 10**9})
+        **cluster.report('worker1'), 'url': 'http://unexpected-host'})
     assert response.status_code == 400
 
 

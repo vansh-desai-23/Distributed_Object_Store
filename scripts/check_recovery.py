@@ -92,6 +92,7 @@ print(json.dumps(result))
             for cycle in range(2):
                 stopped = 'worker2' if cycle == 0 else next(
                     r['worker_id'] for r in metadata()['chunks'][0]['replicas'] if r['worker_id'] != 'worker2')
+                before = next(w for w in status()['workers'] if w['worker_id'] == stopped)
                 docker('stop', stopped)
                 print(f'Cycle {cycle + 1}: stopped {stopped}', flush=True)
                 # Exercise fallback before waiting for the heartbeat threshold.
@@ -103,6 +104,11 @@ print(json.dumps(result))
                 docker('start', stopped)
                 stopped = None
                 wait_for(lambda: all(w['available'] for w in status()['workers']), 'worker registered again')
+                after = next(w for w in status()['workers'] if w['worker_id'] == before['worker_id'])
+                require(after['storage_id'] == before['storage_id'] and after['boot_id'] != before['boot_id'],
+                        'Restart must preserve storage identity and change boot identity')
+                require(after['eligible'], 'Returning worker was not reconciled')
+                print('PASS: persistent storage identity, fresh boot and reconciled eligibility', flush=True)
                 wait_for(lambda: replicated(exact=True), 'return reconciled to exactly two healthy replicas')
                 physical_replicas()
                 verify_download()

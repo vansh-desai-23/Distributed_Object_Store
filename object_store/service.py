@@ -8,11 +8,13 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 import httpx
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from object_store.common import CHUNK_SIZE, checksum
-from object_store.models import Chunk, Replica, StoredObject, Worker, now
+from object_store.models import Chunk, Replica, StoredObject, Worker, OperationClock, WorkerOperation, RepairJob, now
+
+from object_store.repair_queue import enqueue, current, needs_repair
 
 log = logging.getLogger(__name__)
 
@@ -26,9 +28,12 @@ class Store:
         self.maintenance_lock = asyncio.Lock()
         self.upload_slots = asyncio.Semaphore(2)
         self.download_slots = asyncio.Semaphore(4)
-        self.scrub_cursor = 0
+        self.repair_intents = {}
 
     def live(self, worker):
+        return worker.eligible and self.reachable(worker)
+
+    def reachable(self, worker):
         timestamp = worker.last_seen.replace(tzinfo=timezone.utc)
         return (now() - timestamp).total_seconds() < self.worker_timeout
 
@@ -39,11 +44,43 @@ class Store:
         return obj
 
     async def request(self, method, worker, chunk_id, **kwargs):
+        headers = dict(kwargs.pop("headers", {}))
+        headers.update({"X-Worker-Storage": worker.storage_id or "", "X-Worker-Boot": worker.boot_id or ""})
+        sequence = None
+        with self.sessions() as session:
+            chunk = session.get(Chunk, chunk_id)
+            revision = self.repair_intents.get(chunk_id)
+            if chunk and (method == 'PUT' or revision is not None) and not current(session, chunk, revision):
+                return None
+        if method in ('PUT', 'DELETE'):
+            with self.sessions.begin() as session:
+                if session.get(OperationClock, 1) is None:
+                    session.add(OperationClock(id=1, value=0))
+                    session.flush()
+                sequence = session.scalar(update(OperationClock).where(OperationClock.id == 1)
+                                          .values(value=OperationClock.value + 1).returning(OperationClock.value))
+                operation = session.get(WorkerOperation, (chunk_id, worker.id))
+                if operation is None:
+                    operation = WorkerOperation(chunk_id=chunk_id, worker_id=worker.id)
+                    session.add(operation)
+                operation.sequence, operation.method, operation.state = sequence, method, 'pending'
+            headers['X-Operation-Sequence'] = str(sequence)
         # PUT/DELETE are idempotent; retry once after an ambiguous network failure.
         for attempt in range(2):
             try:
-                response = await self.client.request(method, f"{worker.url}/internal/chunks/{chunk_id}", **kwargs)
+                response = await self.client.request(method, f"{worker.url}/internal/chunks/{chunk_id}", headers=headers, **kwargs)
                 if response.status_code < 500 or attempt:
+                    with self.sessions() as session:
+                        registered = session.get(Worker, worker.id)
+                        if registered is None or registered.membership_version != worker.membership_version:
+                            return None
+                    if sequence is not None:
+                        with self.sessions.begin() as session:
+                            operation = session.get(WorkerOperation, (chunk_id, worker.id))
+                            if operation.sequence != sequence:
+                                return None
+                            operation.state = ('done' if response.status_code in (200, 204) else
+                                               'pending' if response.status_code >= 500 else 'rejected')
                     return response
             except httpx.HTTPError:
                 if attempt:
@@ -55,9 +92,11 @@ class Store:
         with self.sessions() as session:
             replicas = session.scalars(select(Replica).where(Replica.chunk_id == chunk.id)).all()
             workers = [(r, session.get(Worker, r.worker_id)) for r in replicas]
-        # Try live/healthy replicas first, but a stale heartbeat alone does not prove data inaccessible.
+        # Rejoining and expired workers are excluded until inventory is reconciled.
         workers.sort(key=lambda pair: (not self.live(pair[1]), pair[0].state != "healthy"))
         for replica, worker in workers:
+            if not self.live(worker):
+                continue
             response = await self.request("GET", worker, chunk.id)
             if response is not None and response.status_code == 200:
                 data = response.content
@@ -74,16 +113,23 @@ class Store:
                     row = session.get(Replica, (chunk.id, worker.id))
                     if row:
                         row.state = "bad"
+                    enqueue(session, chunk.id, "read_failure", invalidate=True)
         raise HTTPException(503, f"No valid reachable replica for chunk {chunk.position}")
 
     async def place(self, chunk, data):
+        revision = self.repair_intents.get(chunk.id)
         with self.sessions() as session:
+            if not current(session, chunk, revision):
+                return False
             replicas = session.scalars(select(Replica).where(Replica.chunk_id == chunk.id)).all()
             healthy = {r.worker_id for r in replicas if r.state == "healthy" and self.live(session.get(Worker, r.worker_id))}
             workers = [w for w in session.scalars(select(Worker)) if self.live(w) and w.id not in healthy]
             counts = dict(session.execute(select(Replica.worker_id, func.count()).group_by(Replica.worker_id)).all())
         workers.sort(key=lambda w: (counts.get(w.id, 0), w.id))
         for worker in workers:
+            with self.sessions() as session:
+                if not current(session, chunk, revision):
+                    return False
             if len(healthy) >= 2:
                 break
             if worker.free_bytes < chunk.size + 10_000_000:
@@ -96,6 +142,8 @@ class Store:
                     continue
             # Record the destination before sending bytes. A lost acknowledgment can be cleaned up.
             with self.sessions.begin() as session:
+                if not current(session, chunk, revision):
+                    return False
                 replica = session.get(Replica, (chunk.id, worker.id))
                 if replica is None:
                     session.add(Replica(chunk_id=chunk.id, worker_id=worker.id, state="pending"))
@@ -107,11 +155,17 @@ class Store:
             if response is not None and response.status_code == 200:
                 try:
                     ack = response.json()
-                    valid = ack["checksum"] == chunk.checksum and ack["size"] == chunk.size
+                    valid = ack["chunk_id"] == chunk.id and ack["checksum"] == chunk.checksum and ack["size"] == chunk.size
                 except (ValueError, KeyError, TypeError):
                     valid = False
                 if valid:
+                    verified = await self.request('GET', worker, chunk.id)
+                    valid = (verified is not None and verified.status_code == 200
+                             and len(verified.content) == chunk.size and checksum(verified.content) == chunk.checksum)
+                if valid:
                     with self.sessions.begin() as session:
+                        if not current(session, chunk, revision):
+                            return False
                         session.get(Replica, (chunk.id, worker.id)).state = "healthy"
                     healthy.add(worker.id)
         return len(healthy) >= 2
@@ -218,6 +272,8 @@ class Store:
 
     async def repair(self, chunk, scrub=False):
         with self.sessions() as session:
+            if not current(session, chunk, self.repair_intents.get(chunk.id)):
+                return
             replicas = session.scalars(select(Replica).where(Replica.chunk_id == chunk.id)).all()
             targets = [(r, session.get(Worker, r.worker_id)) for r in replicas]
         valid = []
@@ -238,6 +294,8 @@ class Store:
                     # A timeout/server error cannot establish whether the bytes are corrupt.
                     state = "pending" if replica.state != "bad" else "bad"
                 with self.sessions.begin() as session:
+                    if not current(session, chunk, self.repair_intents.get(chunk.id)):
+                        return
                     session.get(Replica, (chunk.id, worker.id)).state = state
                 if state == "healthy":
                     valid.append(worker.id)
@@ -264,12 +322,17 @@ class Store:
             if response is not None and response.status_code == 200 and checksum(response.content) == chunk.checksum and len(response.content) == chunk.size:
                 verified.append(worker.id)
                 with self.sessions.begin() as session:
+                    if not current(session, chunk, self.repair_intents.get(chunk.id)):
+                        return
                     session.get(Replica, (chunk.id, worker.id)).state = "healthy"
             if len(verified) == 2:
                 break
         if len(verified) < 2:
             return
         for replica, worker in targets:
+            with self.sessions() as session:
+                if not current(session, chunk, self.repair_intents.get(chunk.id)):
+                    return
             if worker.id in verified or not self.live(worker):
                 continue
             response = await self.request("DELETE", worker, chunk.id)
@@ -284,12 +347,9 @@ class Store:
 
     async def maintenance(self, full_scrub=False):
         async with self.maintenance_lock:
+            await self.registry.reconcile()
             with self.sessions() as session:
                 objects = session.scalars(select(StoredObject.id).order_by(StoredObject.id)).all()
-                all_chunks = session.scalars(select(Chunk.id).order_by(Chunk.id)).all()
-            # Bounded periodic scrubbing: one batch per pass, eventually visiting every chunk.
-            batch = all_chunks[self.scrub_cursor:self.scrub_cursor + 16]
-            self.scrub_cursor = self.scrub_cursor + 16 if self.scrub_cursor + 16 < len(all_chunks) else 0
             for identity in objects:
                 if self.locks[identity].locked():
                     continue
@@ -311,5 +371,45 @@ class Store:
                             if obj is None or obj.state != "available":
                                 continue
                             chunks = session.scalars(select(Chunk).where(Chunk.object_id == identity)).all()
-                        for chunk in chunks:
-                            await self.repair(chunk, full_scrub or chunk.id in batch)
+                        with self.sessions.begin() as session:
+                            for chunk in chunks:
+                                if full_scrub or needs_repair(self, session, chunk.id):
+                                    enqueue(session, chunk.id, 'verification' if full_scrub else 'availability')
+            with self.sessions() as session:
+                jobs = session.scalars(select(RepairJob).order_by(RepairJob.updated_at, RepairJob.chunk_id).limit(32)).all()
+            for job in jobs:
+                with self.sessions() as session:
+                    chunk = session.get(Chunk, job.chunk_id)
+                if chunk is None:
+                    continue
+                if self.locks[chunk.object_id].locked():
+                    with self.sessions.begin() as session:
+                        pending = session.get(RepairJob, chunk.id)
+                        if pending:
+                            pending.updated_at = now()
+                    continue
+                async with self.locks[chunk.object_id]:
+                    with self.sessions.begin() as session:
+                        if not current(session, chunk, job.revision):
+                            continue
+                        session.get(RepairJob, chunk.id).attempts += 1
+                    self.repair_intents[chunk.id] = job.revision
+                    try:
+                        await self.repair(chunk, scrub=True)
+                        with self.sessions.begin() as session:
+                            if current(session, chunk, job.revision):
+                                pending = session.get(RepairJob, chunk.id)
+                                if not needs_repair(self, session, chunk.id):
+                                    session.delete(pending)
+                                else:
+                                    pending.last_error = 'Awaiting valid source, capacity or worker recovery'
+                                    pending.updated_at = now()
+                    except Exception as error:
+                        log.exception('Repair job deferred: chunk=%s', chunk.id)
+                        with self.sessions.begin() as session:
+                            pending = session.get(RepairJob, chunk.id)
+                            if pending:
+                                pending.last_error = type(error).__name__
+                                pending.updated_at = now()
+                    finally:
+                        self.repair_intents.pop(chunk.id, None)

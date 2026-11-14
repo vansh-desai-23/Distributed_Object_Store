@@ -498,6 +498,38 @@
   },
   "components": {
     "schemas": {
+      "DamageReport": {
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Event Id"
+          },
+          "chunk_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Chunk Id"
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Sequence"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "event_id",
+          "chunk_id",
+          "sequence",
+          "reason"
+        ],
+        "title": "DamageReport"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -510,6 +542,42 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "ScanProgress": {
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "maxLength": 36,
+            "title": "Cursor",
+            "default": ""
+          },
+          "ceiling": {
+            "type": "string",
+            "maxLength": 36,
+            "title": "Ceiling",
+            "default": ""
+          },
+          "cycles": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cycles",
+            "default": 0
+          },
+          "checked": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Checked",
+            "default": 0
+          },
+          "pending_damage": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Pending Damage",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "ScanProgress"
       },
       "ValidationError": {
         "properties": {
@@ -568,13 +636,43 @@
             "type": "integer",
             "minimum": 0.0,
             "title": "Free Bytes"
+          },
+          "storage_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Storage Id"
+          },
+          "boot_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Boot Id"
+          },
+          "damage_reports": {
+            "items": {
+              "$ref": "#/components/schemas/DamageReport"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "title": "Damage Reports"
+          },
+          "scan_progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScanProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
         "required": [
           "worker_id",
           "url",
-          "free_bytes"
+          "free_bytes",
+          "storage_id",
+          "boot_id"
         ],
         "title": "WorkerReport"
       }

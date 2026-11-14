@@ -98,3 +98,24 @@ No Git commit or push has been made. Phases 1–7 constitute the required backen
 - Mid-stream unrecoverable data terminates a download; clients must verify the final size/checksum.
 - Local sandbox restrictions blocked localhost access and thread-backed tests; approved executions outside that sandbox completed the checks.
 - Generated demonstration objects are deleted by the script, and stopped workers are restored. No user object is deliberately corrupted or deleted.
+
+## 2026-11-15 — Reliability upgrade Phase 1
+
+- Safety baseline committed as `b9fcf1e` at the user's request. The reliability upgrade changes remain uncommitted; nothing has been pushed.
+- `.venv/bin/pytest -q`: **74 passed** in 19.48 seconds. Two Alembic configuration deprecation warnings concern the existing unspecified `path_separator`; migration assertions passed. New tests cover persistent/fresh identities, changed volume rejection, read/placement eligibility, inventory authority and discovery, orphan cleanup, failed reconciliation retry, boot/re-registration races, request targeting, initial readiness, and the additive migration. After correcting the existing URL-allowlist test to supply required identity fields, its targeted rerun passed (1 test).
+- `docker compose up -d --build --wait`: rebuilt the local services and applied migration 0002 without deleting existing volumes. All six services became healthy. The final build uses worker `/ready` health checks.
+- `scripts/check_foundation.py`: PostgreSQL migration head and model/schema agreement, six separate volumes, worker DNS/identities and advancing heartbeats passed after the schema upgrade.
+- `scripts/check_recovery.py`: two real Docker worker stop/start cycles with a 10,000,000-byte object passed. Each cycle verified checksum-correct downloads, heartbeat expiry, restoration of two live physical replicas, matching persistent storage UUID and changed boot UUID on return, reconciled eligibility, and convergence to exactly two copies. Stopped workers were restored and test chunks cleaned up.
+- No 100/500 MB rerun or refreshed ZIP is claimed for this upgrade phase. Previous size evidence remains historical; final upgrade packaging and broader boundary verification belong to upgrade Phase 3.
+
+## 2026-11-15 — Reliability upgrade Phase 2
+
+- `.venv/bin/pytest -q --tb=short`: **86 passed** in 60.29 seconds. The two warnings are the pre-existing Alembic `path_separator` deprecation warnings. Twelve new protocol tests cover completed receipt replay/reordering, interrupted PUT/DELETE recovery, persistent scan cursor/outbox, fixed scan boundaries, trusted catalog checks, damage acknowledgment/deduplication, obsolete reports, superseded repair intents, queued deletion, sequence preservation and legacy-catalog adoption. Existing integrity tests now exercise worker scans/reporting rather than the removed routine controller scrub.
+- `docker compose up -d --build --wait`: all six services rebuilt/healthy, migration 0003 applied while retaining existing volumes. Worker catalogs use SQLite inside the existing worker volumes; the controller remains PostgreSQL. No new container was added.
+- `scripts/check_foundation.py`: PostgreSQL migration head/model-schema consistency, volume isolation, service health, identities and heartbeat advancement passed.
+- `scripts/check_integrity.py` (10 MB): byte corruption, malformed manifest and consistently altered bytes/manifest were detected and repaired to exactly two original copies. With the controller paused, a worker-local scan produced and retained the manifest damage event; after unpausing, repair completed without a download trigger. Test data was cleaned up and the controller restored.
+- `scripts/check_recovery.py` (10 MB): two real worker stop/start cycles passed heartbeat expiry, live replica restoration, physical checksum verification, persistent storage identity/fresh boot, return reconciliation and final cleanup.
+- After the final current-intent/stale-expectation guards, the rebuilt deployment passed `scripts/check_storage.py`: 0, 1, 1,000,000, 1,000,001, 2,500,000 and **100,000,000** bytes, upload/download checksums, two physical replicas, list/metadata/PATCH, and cleanup.
+- No new Git commit or push was performed. The baseline remains `b9fcf1e`; both reliability upgrades are working-tree changes. The existing ZIP has not been regenerated: general CLI, expanded boundary coverage and final archive refresh remain upgrade Phase 3.
+
+- Final `scripts/check_lifecycle.py`: pending offline deletion survived a controller restart, worker return completed physical cleanup, late PUTs were rejected on every worker, and test-object cleanup was confirmed.
