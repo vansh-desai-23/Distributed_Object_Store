@@ -60,7 +60,7 @@ def main():
         require({w["worker_id"] for w in status.json()["workers"] if w["available"]} ==
                 {f"worker{i}" for i in range(1, 5)}, "All four local workers must be available")
         try:
-            for size in (0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 2_500_000, args.size_mb * CHUNK_SIZE):
+            for size in (0, 1, CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1, 2 * CHUNK_SIZE, 2 * CHUNK_SIZE + 1, 2_500_000, args.size_mb * CHUNK_SIZE):
                 path = Path(directory) / "phase3.bin"
                 expected_hashes = []
                 digest = hashlib.sha256()

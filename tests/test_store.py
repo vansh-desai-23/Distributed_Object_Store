@@ -13,7 +13,7 @@ from object_store.models import Chunk, Replica, StoredObject
 from object_store.worker import ChunkDisk
 
 
-@pytest.mark.parametrize("size", [0, 1, CHUNK_SIZE, CHUNK_SIZE + 1, 2_500_000])
+@pytest.mark.parametrize("size", [0, 1, CHUNK_SIZE - 1, CHUNK_SIZE, CHUNK_SIZE + 1, 2 * CHUNK_SIZE, 2 * CHUNK_SIZE + 1, 2_500_000])
 async def test_roundtrip_boundaries(cluster, size):
     data = (b"\x00\xffbinary\r\n" * (size // 10 + 1))[:size]
     response = await cluster.upload(data)

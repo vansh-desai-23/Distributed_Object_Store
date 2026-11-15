@@ -8,8 +8,9 @@ The system stores arbitrary bytes in decimal 1 MB chunks, with two replicas per 
 
 ## Submission contents
 
-- `object_store/`: controller, worker, coordinator, metadata models and shared validation.
-- `migrations/`: initial PostgreSQL schema and Alembic runner.
+- `object_store/`: controller, worker, coordinator, metadata models, shared validation and operational CLI.
+- `store`: executable CLI launcher; `docs/cli.md`: command reference and download safety contract.
+- `migrations/`: versioned PostgreSQL schema migrations and Alembic runner.
 - `Dockerfile`, `compose.yaml`, locked dependencies: reproducible local environment.
 - `tests/`: automated behavioral tests, including failure/concurrency/integrity checks.
 - `scripts/`: phase acceptance checks, combined demo, isolated fresh-deployment verification and packaging.
@@ -19,7 +20,7 @@ The system stores arbitrary bytes in decimal 1 MB chunks, with two replicas per 
 - `README.md`: setup and commands; `AGENT.md`: decisions and precise file inventory.
 - Supplied project brief, unchanged.
 
-The ZIP excludes `.git`, virtual environments, credentials/environment files, caches, test binaries, Docker volumes and build output. The Git repository remains local and uncommitted until the owner explicitly requests a commit. `MANIFEST.sha256` inside the ZIP lists each source file's checksum; `dist/SHA256SUMS` checks the ZIP itself.
+The ZIP excludes `.git`, virtual environments, credentials/environment files, caches, test binaries, Docker volumes and build output. Git commits are made only on explicit user instruction; no push is performed automatically. `MANIFEST.sha256` inside the ZIP lists each source file's checksum; `dist/SHA256SUMS` checks the ZIP itself.
 
 ## Set up from an extracted submission
 
@@ -38,7 +39,7 @@ Use Python 3.12+ and Docker Engine with Compose. Internet access is needed for t
 ## Recommended presentation sequence
 
 1. **Explain the architecture.** Open the diagram in `docs/design.md`: one controller, PostgreSQL metadata and four workers with separate volumes. Show `docker compose ps`.
-2. **Show the API.** Open `http://127.0.0.1:8000/docs`. Upload a small file, inspect its metadata/chunk locations, download it, PATCH custom metadata, and list objects. Swagger now exposes the multipart file and metadata fields. Use the README curl commands if preferred.
+2. **Show the CLI and API.** Run `./store --help`, `./store status`, `./store scans` and `./store repairs`. Use `./store upload FILE`, `metadata ID`, `placements ID` and `download ID -o FILE` for the primary walkthrough; see `docs/cli.md`. Open `http://127.0.0.1:8000/docs`. Upload a small file, inspect its metadata/chunk locations, download it, PATCH custom metadata, and list objects. Swagger now exposes the multipart file and metadata fields. Use the README curl commands if preferred.
 3. **Run the main 100 MB demonstration.**
 
    ```bash
@@ -70,7 +71,7 @@ The 500 MB check is optional during the presentation; run `.venv/bin/python scri
 | Registration/heartbeat and internal chunk/inventory APIs | Worker/controller routes and foundation/recovery checks |
 | Worker stop/restart demonstration | Combined demo and two-cycle recovery checker |
 | Intentional corruption and valid-copy recovery | Integrity checker and corruption tests |
-| Runnable instructions and one or more clients | README, Python demo/checkers, curl and Swagger |
+| Runnable instructions and one or more clients | Operational CLI, live CLI checker, Python demos, curl and Swagger |
 | Clean initial deployment | Isolated fresh verifier with new PostgreSQL/worker volumes |
 
 ## Fresh-deployment verification
@@ -82,7 +83,7 @@ docker compose build controller
 .venv/bin/python scripts/verify_fresh.py --large
 ```
 
-This creates a separate random Compose project, network, six fresh volumes, and an ephemeral loopback port. It removes fixed worker container names in its temporary configuration, so it can coexist with the normal deployment. It re-resolves the ephemeral controller port after a restart and verifies initial migrations/registration, 100 MB plus a partial chunk, worker failure/repair, corruption recovery, controller restart, deletion, and optionally 500 MB plus a partial chunk. Its finally block removes only that temporary project's containers, network and volumes. Normal project data is preserved. It reuses the image just built; this is fresh-data deployment verification, not proof of a cold registry download.
+This creates a separate random Compose project, network, six fresh volumes, and an ephemeral loopback port. It removes fixed worker container names in its temporary configuration, so it can coexist with the normal deployment. It re-resolves the ephemeral controller port after a restart and verifies initial migrations/registration, 100 MB plus a partial chunk, worker failure/repair, corruption recovery, controller restart, deletion, and optionally 500 MB plus a partial chunk. The physical-cleanup deadline scales with chunk count (at least 180 seconds, otherwise two seconds per chunk) because every chunk is durably fenced on all four workers. Its finally block removes only that temporary project's containers, network and volumes. Normal project data is preserved. It reuses the image just built; this is fresh-data deployment verification, not proof of a cold registry download.
 
 ## Package the final source
 
@@ -117,4 +118,4 @@ One controller process and one metadata database remain availability dependencie
 
 Upgrade Phases 1–2 add persistent storage/boot identity, inventory-gated readiness, local SQLite catalogs, ordered mutation receipts, persisted worker scan progress, acknowledged damage reports and a durable serial repair queue. PostgreSQL remains the controller database; no containers were added. `scripts/check_integrity.py` now proves worker-local report retention with the controller paused, including catalog rejection of consistently altered bytes/manifest. Status exposes progress and pending repairs. See design.md for protocol/recovery details and validation.md for current evidence.
 
-The existing dist archive predates these upgrades. The operational CLI, expanded boundary matrix and refreshed archive are upgrade Phase 3; regenerate the archive only after final validation.
+Upgrade Phase 3 includes the operational CLI, complete chunk-boundary matrix and refreshed archive. Regenerate the archive after source/documentation changes and verify `dist/SHA256SUMS` before delivery. See validation.md for the actual final checks.

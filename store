@@ -1,0 +1,9 @@
+#!/bin/sh
+# Resolve the project without changing the caller's working directory.
+STORE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -x "$STORE_ROOT/.venv/bin/python" ]; then
+    STORE_PYTHON="$STORE_ROOT/.venv/bin/python"
+else
+    STORE_PYTHON=python3
+fi
+PYTHONPATH="$STORE_ROOT${PYTHONPATH:+:$PYTHONPATH}" exec "$STORE_PYTHON" -m object_store.cli "$@"

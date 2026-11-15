@@ -2,9 +2,28 @@
 
 Python REST backend for one controller and four persistent storage workers, using PostgreSQL metadata and Docker Compose. Objects are divided into decimal 1 MB chunks with two replicas on different workers. No frontend or cloud account is needed.
 
+## Command-line client
+
+Use `./store` for a clean terminal interface (the launcher uses your project `.venv`):
+
+```bash
+./store upload report.pdf --meta owner=student
+./store list
+./store metadata OBJECT_ID
+./store placements OBJECT_ID
+./store download OBJECT_ID -o downloaded.pdf
+./store patch OBJECT_ID --meta owner=updated
+./store status
+./store scans
+./store repairs
+./store delete OBJECT_ID
+```
+
+Downloads are size/SHA-256 verified before saving the final file. Existing destinations require `--force`. Add `--json` for scripts, `--url` for another controller, or `--help` for command options. See [docs/cli.md](docs/cli.md) for the complete guide.
+
 ## Submission guide
 
-See [docs/submission.md](docs/submission.md) for the presentation sequence, requirement-to-evidence mapping, fresh-deployment verification, packaging instructions and known limitations. The required backend covers original Phases 1–7; the optional custom frontend remains deferred. Reliability upgrade Phases 1–2 (safe membership, local integrity and durable repair) are implemented. Upgrade Phase 3 (operational CLI, expanded boundaries and final packaging) remains planned. Existing archives in `dist/` must be rebuilt to include current source changes.
+See [docs/submission.md](docs/submission.md) for the presentation sequence, requirement-to-evidence mapping, fresh-deployment verification, packaging instructions and known limitations. The required backend covers original Phases 1–7; the optional custom frontend remains deferred. Reliability upgrade Phases 1–2 (safe membership, local integrity and durable repair) are implemented. Reliability upgrade Phase 3 adds the operational CLI, complete chunk-boundary coverage and refreshed submission packaging. Regenerate archives in `dist/` after any subsequent changes.
 
 To create the source submission archive after validation:
 
@@ -46,7 +65,7 @@ It verifies the six healthy services, isolated writable named volumes, PostgreSQ
 .venv/bin/python scripts/check_storage.py --size-mb 500
 ```
 
-Requires the running local Compose stack and the Python dependencies installed below. This exercises empty, one-byte, exact 1 MB, 1 MB + 1 byte, 2.5 MB, and 100 MB files by default. It verifies chunk ordering/sizes/hashes, two distinct replicas, downloads, listing, duplicate filenames, and metadata GET/PATCH. Worker inventory APIs independently verify the actual stored replicas. It creates and cleans up only its own test objects, and does not stop containers or inject corruption. Run with all four workers available and without simultaneous fault demonstrations.
+Requires the running local Compose stack and the Python dependencies installed below. This exercises empty, one-byte, 1 MB − 1 byte, exact 1 MB, 1 MB + 1 byte, exact 2 MB, 2 MB + 1 byte, 2.5 MB, and 100 MB files by default. It verifies chunk ordering/sizes/hashes, two distinct replicas, downloads, listing, duplicate filenames, and metadata GET/PATCH. Worker inventory APIs independently verify the actual stored replicas. It creates and cleans up only its own test objects, and does not stop containers or inject corruption. Run with all four workers available and without simultaneous fault demonstrations.
 
 ## Phase 4 lifecycle acceptance
 
@@ -167,6 +186,6 @@ Workers use Python's built-in SQLite module for a small `catalog.sqlite` file in
 - The controller coalesces read failures, availability changes, inventory findings and damage reports into one persistent repair job per chunk. One serial loop handles up to 32 jobs per pass, verifies replacement bytes and checks current object/repair intent before publication. Unresolved jobs retain attempts/error details and retry.
 - Mutations carry a durable increasing operation sequence. Workers record the sequence and intent before changing files, retain completion receipts, reject stale/conflicting requests, and recover interrupted publication/deletion on startup. Permanent deletion markers still forbid resurrection at any sequence.
 
-`GET /api/v1/status` includes each worker's last reported `scan_progress` and up to 100 pending `repair_jobs` (reason, revision, attempts and last error). Worker `GET /internal/scan` exposes local progress and up to 100 unacknowledged reports on the internal network. These are inspection APIs; the general operational CLI is Phase 3.
+`GET /api/v1/status` includes each worker's last reported `scan_progress` and up to 100 pending `repair_jobs` (reason, revision, attempts and last error). Worker `GET /internal/scan` exposes local progress and up to 100 unacknowledged reports on the internal network. The CLI exposes these inspection APIs through `store status`, `store scans` and `store repairs`.
 
 Catalogs, operation high-water marks, deduplication receipts and permanent deletion markers are retained rather than garbage-collected. Back up controller metadata and worker volumes together; restoring an older controller database against newer worker sequence records is not supported. The system continues to require one controller process and one worker process per volume.

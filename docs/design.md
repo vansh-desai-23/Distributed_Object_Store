@@ -1,4 +1,4 @@
-# Phase 1: backend design and implemented contract
+# Backend architecture and implemented contract
 
 This is the finalized baseline for the local coursework deployment. The implementation follows this design; limitations are explicit below.
 
@@ -166,7 +166,7 @@ This is a local teaching system. Full inventories and metadata/list responses ar
 | Requirement | Verification |
 |---|---|
 | Arbitrary bytes and original reconstruction | Binary boundary tests and SHA-256 round trips; 100/500 MB demo |
-| Decimal chunk size and final partial chunk | Empty, 1 byte, 1 MB, 1 MB + 1 byte, 2.5 MB tests |
+| Decimal chunk size and final partial chunk | 0, 1, C−1, C, C+1, 2C, 2C+1 and 2.5 MB tests (C = 1,000,000 bytes) |
 | Two distinct replicas and worker distribution | Metadata assertions and demo checks across four workers |
 | Metadata without re-upload | PATCH tests preserve object checksum; concurrent updates merge |
 | Worker stop/restart | Demo uses `docker stop worker2` / `docker start worker2`; tests check repair and surplus cleanup |
@@ -221,3 +221,11 @@ One maintenance loop processes up to 32 queued jobs in timestamp order under the
 Operational views: controller status includes last reported per-worker scan progress and the first 100 repair jobs; worker `/internal/scan` includes progress and the first 100 outstanding events. These views are snapshots, not atomic cluster-wide integrity proofs. Metadata scans still scale with chunk count, and rejoin inventory remains a full checksum pass; ordinary integrity scans are local and bounded.
 
 No automatic receipt/high-water/tombstone garbage collection is implemented. Restoring an old metadata database independently of worker catalogs can roll back controller sequencing and is unsupported; preserve both together. Single-controller/single-process-per-volume and trusted internal-network assumptions remain. These mechanisms protect ordering and recovery, not loss of both replicas or physical-host loss.
+
+## Reliability upgrade Phase 3: operational client and submission
+
+`object_store.cli` provides upload, verified download, paginated list, metadata, PATCH, DELETE, status, placement, scan and repair inspection. The executable `store` launcher preserves the caller's working directory and chooses the project virtual environment when available. The client uses existing HTTPX plus standard-library argparse; no new dependency or service is needed. Output uses simple aligned columns; JSON mode supports scripts.
+
+Downloads stream to an adjacent temporary file, verify exact metadata size/SHA-256, fsync file contents and publish atomically. Default publication refuses an existing destination, including a concurrent creation; explicit --force replaces only after verification. Failed/cancelled transfers remove temporary files. Uploads stream multipart content and are not automatically retried. Public upload idempotency remains a documented separate enhancement, not a prerequisite for Phase 3.
+
+Unit/integration boundary cases cover 0, 1, C−1, C, C+1, 2C, 2C+1 and 2.5 MB. The same matrix is exercised by the physical storage checker. CLI tests cover HTTP contracts, pagination, read-only inspection, JSON/errors, metadata parsing, control-character sanitization, verified downloads, overwrite protection and interrupted/corrupt transfers. `scripts/check_cli.py` exercises every CLI command against real services. Final evidence and fresh 100/500 MB deployment results are recorded in validation.md; packaging includes the executable launcher and verifies every source member/checksum.

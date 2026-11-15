@@ -138,7 +138,12 @@ print('PASS: every chunk has exactly two independently verified physical copies'
                                  'controller restarted with persisted metadata')
                         download(expected, size)
                     require(client.delete(f'/api/v1/objects/{identity}').status_code == 204, 'Delete failed')
-                    wait_for(lambda: get_json('/api/v1/status')['pending_cleanup_objects'] == 0, 'test object cleanup completed')
+                    # Cleanup durably fences every chunk on all four workers. Its work
+                    # scales with chunk count, unlike a small status/API probe.
+                    cleanup_timeout = max(180, 2 * meta['chunk_count'])
+                    print(f'Waiting for physical cleanup of {meta["chunk_count"]} chunks (deadline {cleanup_timeout}s)', flush=True)
+                    wait_for(lambda: get_json('/api/v1/status')['pending_cleanup_objects'] == 0,
+                             'test object cleanup completed', timeout=cleanup_timeout)
                     require(client.get(f'/api/v1/objects/{identity}').status_code == 404, 'Deleted object remains visible')
                     identity = None
                     path.unlink()

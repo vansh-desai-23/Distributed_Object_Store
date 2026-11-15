@@ -5,7 +5,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TOP_LEVEL = (
-    'AGENT.md', 'README.md', 'Dockerfile', 'compose.yaml', 'alembic.ini',
+    'AGENT.md', 'README.md', 'store', 'Dockerfile', 'compose.yaml', 'alembic.ini',
     'pyproject.toml', 'requirements.txt', 'requirements-dev.txt', '.gitignore',
     '.dockerignore', 'Mini_Distributed_Cloud_Object_Store.pdf',
 )
@@ -33,7 +33,7 @@ def main():
         for name, data in files.items():
             info = zipfile.ZipInfo('mini-distributed-object-store/' + name, (2026, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o100644 << 16
+            info.external_attr = (0o100755 if name == 'store' else 0o100644) << 16
             bundle.writestr(info, data)
     with zipfile.ZipFile(archive) as bundle:
         if bundle.testzip() is not None or len(bundle.namelist()) != len(files):
