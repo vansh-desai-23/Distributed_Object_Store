@@ -7,7 +7,7 @@ Python REST backend for one controller and four persistent storage workers, usin
 Use `./store` for a clean terminal interface (the launcher uses your project `.venv`):
 
 ```bash
-./store upload report.pdf --meta owner=student
+./store upload report.pdf --meta owner=student --idempotency-key report-upload-001
 ./store list
 ./store metadata OBJECT_ID
 ./store placements OBJECT_ID
@@ -189,3 +189,18 @@ Workers use Python's built-in SQLite module for a small `catalog.sqlite` file in
 `GET /api/v1/status` includes each worker's last reported `scan_progress` and up to 100 pending `repair_jobs` (reason, revision, attempts and last error). Worker `GET /internal/scan` exposes local progress and up to 100 unacknowledged reports on the internal network. The CLI exposes these inspection APIs through `store status`, `store scans` and `store repairs`.
 
 Catalogs, operation high-water marks, deduplication receipts and permanent deletion markers are retained rather than garbage-collected. Back up controller metadata and worker volumes together; restoring an older controller database against newer worker sequence records is not supported. The system continues to require one controller process and one worker process per volume.
+
+## Retry uploads safely
+
+Choose a unique key for each intended object and reuse it if the response is lost:
+
+```bash
+./store upload report.pdf --meta owner=student --idempotency-key report-upload-001
+# Retry the identical command with the same key.
+```
+
+The API accepts the optional `Idempotency-Key` header on `POST /api/v1/objects`. Matching requests return the saved original 201 response and object ID, with `Idempotency-Replayed: true` on a replay (`false` on the first success). The key binds the file bytes, normalized filename, content type and custom metadata. Changed requests return 409. Matching retries after deletion return 410; use a new key to intentionally create another object.
+
+Keys are case-sensitive, globally scoped in this local service, and contain 1–128 ASCII letters/digits or `. _ : -` (without spaces). Receipts persist in PostgreSQL across controller restarts and are retained after object cleanup. A failed, unpublished attempt can retry with the same key and identical payload; its old partial data remains subject to cleanup. Requests still in progress can return 409 and should be retried later. Replays return the original response snapshot; use metadata/status APIs for current metadata and replica health.
+
+Uploads without a key remain independent. The CLI does not retry automatically or generate a key implicitly. Keyed retries resend the complete request, with a bounded extra hashing pass over the existing upload spool; this is not resumable upload. Verify the feature with `.venv/bin/python scripts/check_idempotency.py` (includes a controller restart and only deletes its own test object).

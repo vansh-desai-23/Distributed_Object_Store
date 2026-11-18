@@ -91,6 +91,7 @@ def parser():
             command.add_argument('--meta', action='append', default=[], metavar='KEY=VALUE', help='Repeat for multiple metadata fields')
         if name == 'upload':
             command.add_argument('file', type=Path)
+            command.add_argument('--idempotency-key', help='Reuse this key when retrying the identical upload')
             command.add_argument('--type', dest='content_type', help='Override the MIME type')
         if name == 'download':
             command.add_argument('-o', '--output', type=Path, required=True, help='Destination file')
@@ -158,7 +159,8 @@ def execute(args, client, progress):
         content_type = args.content_type or mimetypes.guess_type(args.file.name)[0] or 'application/octet-stream'
         with args.file.open('rb') as stream:
             return check(client.post(path, files={'file': (args.file.name, stream, content_type)},
-                                     data={'metadata': json.dumps(metadata_pairs(args.meta))})).json()
+                                     data={'metadata': json.dumps(metadata_pairs(args.meta))},
+                                     headers={'Idempotency-Key': args.idempotency_key} if args.idempotency_key is not None else {})).json()
     if command == 'download':
         return download(client, args.object_id, args.output, args.force, progress)
     if command == 'list':

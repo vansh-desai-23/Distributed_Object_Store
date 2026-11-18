@@ -9,11 +9,12 @@ from uuid import uuid4
 from fastapi import HTTPException
 import httpx
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
 from object_store.common import CHUNK_SIZE, checksum
-from object_store.models import Chunk, Replica, StoredObject, Worker, OperationClock, WorkerOperation, RepairJob, now
+from object_store.models import Chunk, Replica, StoredObject, Worker, OperationClock, WorkerOperation, RepairJob, UploadReceipt, now
 
+from object_store.idempotency import UploadIdempotency, upload_attributes, fingerprint
 from object_store.repair_queue import enqueue, current, needs_repair
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class Store:
         self.upload_slots = asyncio.Semaphore(2)
         self.download_slots = asyncio.Semaphore(4)
         self.repair_intents = {}
+        self.idempotency = UploadIdempotency(self)
 
     def live(self, worker):
         return worker.eligible and self.reachable(worker)
@@ -170,18 +172,20 @@ class Store:
                     healthy.add(worker.id)
         return len(healthy) >= 2
 
-    async def upload(self, file, metadata):
+    async def upload(self, file, metadata, idempotency=None):
         identity = str(uuid4())
         async with self.upload_slots, self.locks[identity]:
             with self.sessions() as session:
                 if sum(self.live(w) for w in session.scalars(select(Worker))) < 2:
                     raise HTTPException(503, "At least two available workers are required")
-            name = (file.filename or "object").replace("\\", "/").split("/")[-1] or "object"
-            content_type = file.content_type or "application/octet-stream"
-            if len(name) > 255 or len(content_type) > 255 or any(ord(c) < 32 or ord(c) > 126 for c in content_type):
-                raise HTTPException(400, "Invalid filename or content type")
-            with self.sessions.begin() as session:
-                session.add(StoredObject(id=identity, name=name, content_type=content_type, custom_metadata=metadata))
+            name, content_type = upload_attributes(file)
+            try:
+                with self.sessions.begin() as session:
+                    if idempotency:
+                        self.idempotency.claim(session, *idempotency, identity)
+                    session.add(StoredObject(id=identity, name=name, content_type=content_type, custom_metadata=metadata))
+            except IntegrityError:
+                raise HTTPException(409, "Upload key was claimed concurrently; retry with the same key") from None
             try:
                 digest = hashlib.sha256()
                 size = count = 0
@@ -195,38 +199,53 @@ class Store:
                         raise HTTPException(503, "Unable to store two durable replicas; upload aborted")
                     size += len(data)
                     count += 1
+                if idempotency and fingerprint(name, content_type, metadata, size, digest.hexdigest()) != idempotency[1]:
+                    raise HTTPException(409, 'Upload content changed while being processed')
                 with self.sessions.begin() as session:
                     obj = session.get(StoredObject, identity)
                     obj.size, obj.chunk_count, obj.checksum = size, count, digest.hexdigest()
                     obj.state = "available"
                     obj.modified_at = now()
+                    session.flush()
+                    result = self.metadata(identity, session=session)
+                    if idempotency:
+                        receipt = session.get(UploadReceipt, idempotency[0])
+                        if receipt.object_id != identity or receipt.state != 'pending':
+                            raise HTTPException(409, 'Upload idempotency claim changed')
+                        receipt.state, receipt.response = 'completed', result
             except BaseException:
                 # Preserve the original failure if the DB is also unavailable. Once the
                 # object lock is released, maintenance can reclaim the uploading intent.
                 try:
                     with self.sessions.begin() as session:
                         obj = session.get(StoredObject, identity)
-                        if obj:
+                        if obj and obj.state == 'uploading':
                             obj.state = "deleting"
+                        if idempotency:
+                            receipt = session.get(UploadReceipt, idempotency[0])
+                            if receipt and receipt.object_id == identity and receipt.state == 'pending':
+                                receipt.state = 'failed'
                 except SQLAlchemyError:
                     log.exception("Upload cleanup marker deferred: object=%s", identity)
                 raise
-        return self.metadata(identity)
+        return result
 
-    def metadata(self, identity):
-        with self.sessions() as session:
-            obj = self.available(session, identity)
-            chunks = session.scalars(select(Chunk).where(Chunk.object_id == identity).order_by(Chunk.position)).all()
-            result = self.summary(obj)
-            result.update(created_at=obj.created_at.isoformat(), modified_at=obj.modified_at.isoformat(),
-                          checksum=obj.checksum, chunk_count=obj.chunk_count, metadata=obj.custom_metadata,
-                          chunk_size=CHUNK_SIZE, chunks=[])
-            for chunk in chunks:
-                replicas = session.scalars(select(Replica).where(Replica.chunk_id == chunk.id)).all()
-                result["chunks"].append({"chunk_id": chunk.id, "position": chunk.position, "size": chunk.size,
-                    "checksum": chunk.checksum, "replicas": [{"worker_id": r.worker_id, "state": r.state,
-                    "available": self.live(session.get(Worker, r.worker_id))} for r in replicas]})
-            return result
+    def metadata(self, identity, session=None):
+        if session is None:
+            with self.sessions() as owned:
+                return self.metadata(identity, session=owned)
+        obj = self.available(session, identity)
+        chunks = session.scalars(select(Chunk).where(Chunk.object_id == identity).order_by(Chunk.position)).all()
+        result = self.summary(obj)
+        result.update(created_at=obj.created_at.isoformat(), modified_at=obj.modified_at.isoformat(),
+                      checksum=obj.checksum, chunk_count=obj.chunk_count, metadata=obj.custom_metadata,
+                      chunk_size=CHUNK_SIZE, chunks=[])
+        for chunk in chunks:
+            replicas = session.scalars(select(Replica).where(Replica.chunk_id == chunk.id)).all()
+            result["chunks"].append({"chunk_id": chunk.id, "position": chunk.position, "size": chunk.size,
+                "checksum": chunk.checksum, "replicas": [{"worker_id": r.worker_id, "state": r.state,
+                "available": self.live(session.get(Worker, r.worker_id))} for r in replicas]})
+        return result
 
     @staticmethod
     def summary(obj):
@@ -342,6 +361,8 @@ class Store:
 
     def recover_startup(self):
         with self.sessions.begin() as session:
+            for receipt in session.scalars(select(UploadReceipt).where(UploadReceipt.state == 'pending')):
+                receipt.state = 'failed'
             for obj in session.scalars(select(StoredObject).where(StoredObject.state == "uploading")):
                 obj.state = "deleting"
 

@@ -107,7 +107,7 @@ Metadata response example (abbreviated):
 | Worker | `GET /health` | 200 service/storage/boot identity and process status; not eligibility |
 | Worker | `GET /ready` | 200 after recent controller-confirmed eligibility; otherwise 503 |
 
-PUT with the same ID/content is repeatable. Different content under an existing ID is 409. Repair of a corrupt manifest first deletes that replica, while holding verified replacement bytes obtained from a valid source, then stores the expected bytes. Public POST has no idempotency-key facility: retrying after a lost 201 may create another complete object. Repeated public DELETE returns 404 after the first succeeds, but does not change the final state; this remains idempotent behavior.
+PUT with the same ID/content is repeatable. Different content under an existing ID is 409. Repair of a corrupt manifest first deletes that replica, while holding verified replacement bytes obtained from a valid source, then stores the expected bytes. Public POST optionally accepts Idempotency-Key for durable replay as specified below; retries without a key may create another complete object. Repeated public DELETE returns 404 after the first succeeds, but does not change the final state; this remains idempotent behavior.
 
 ## Lifecycle and request flows
 
@@ -226,6 +226,22 @@ No automatic receipt/high-water/tombstone garbage collection is implemented. Res
 
 `object_store.cli` provides upload, verified download, paginated list, metadata, PATCH, DELETE, status, placement, scan and repair inspection. The executable `store` launcher preserves the caller's working directory and chooses the project virtual environment when available. The client uses existing HTTPX plus standard-library argparse; no new dependency or service is needed. Output uses simple aligned columns; JSON mode supports scripts.
 
-Downloads stream to an adjacent temporary file, verify exact metadata size/SHA-256, fsync file contents and publish atomically. Default publication refuses an existing destination, including a concurrent creation; explicit --force replaces only after verification. Failed/cancelled transfers remove temporary files. Uploads stream multipart content and are not automatically retried. Public upload idempotency remains a documented separate enhancement, not a prerequisite for Phase 3.
+Downloads stream to an adjacent temporary file, verify exact metadata size/SHA-256, fsync file contents and publish atomically. Default publication refuses an existing destination, including a concurrent creation; explicit --force replaces only after verification. Failed/cancelled transfers remove temporary files. Uploads stream multipart content and are not automatically retried. Optional public upload idempotency is implemented as described below.
 
 Unit/integration boundary cases cover 0, 1, C−1, C, C+1, 2C, 2C+1 and 2.5 MB. The same matrix is exercised by the physical storage checker. CLI tests cover HTTP contracts, pagination, read-only inspection, JSON/errors, metadata parsing, control-character sanitization, verified downloads, overwrite protection and interrupted/corrupt transfers. `scripts/check_cli.py` exercises every CLI command against real services. Final evidence and fresh 100/500 MB deployment results are recorded in validation.md; packaging includes the executable launcher and verifies every source member/checksum.
+
+## Upload idempotency contract
+
+POST /api/v1/objects accepts one optional `Idempotency-Key` header matching `[A-Za-z0-9._:-]{1,128}`. Keys are globally scoped and case-sensitive in this single-controller local service. Without a key, existing independent-upload behavior remains unchanged.
+
+Migration 0004 adds `upload_receipts`: key primary key, versioned SHA-256 request fingerprint, unique object ID, pending/completed/failed state, original response JSON and creation timestamp. Object ID deliberately has no foreign key: completed receipts must survive object deletion. No expiry or recycling is performed.
+
+The request fingerprint includes normalized stored filename, effective content type, canonical sorted custom metadata, exact file size and SHA-256 of its bytes. Metadata key order and multipart boundaries do not affect identity. The parser already spools uploaded bytes; keyed requests read this spool in 1 MB blocks and rewind it. The final stored-byte digest is compared with the precomputed fingerprint before publication, detecting an altered spool. This adds a complete bounded-memory disk-reading pass, not another full in-memory file or resumable transfer.
+
+A per-key asyncio lock serializes matching requests in the supported single-controller process. Receipt claim and invisible object creation share a transaction; existing rows are locked during claims and a unique key constraint guards initial-claim races. In-progress claims return 409 if they cannot be safely retried. Completed requests are replayed before worker availability checks: replay requires metadata access, not new worker writes. The response snapshot and transition to available/completed commit in the same database transaction, under the object's existing lifecycle lock. The response therefore cannot be successfully published without its receipt. A commit acknowledgment failure does not demote an already available object or completed receipt.
+
+Matching successful retries return 201 and the saved original JSON with `Idempotency-Replayed: true`; a first keyed success uses false. Different request fingerprints return 409. Matching retries for deleting or physically removed objects return 410 and never recreate data. Replaying a saved response does not reflect later PATCH or repair state; current metadata remains available separately.
+
+Failures/cancellation mark an unpublished attempt deleting and its receipt failed. The same key/fingerprint may start a new attempt with a new object ID while old partial data is cleaned up; it cannot create a second visible success. Startup marks pending receipts failed along with retiring abandoned uploading objects. If cleanup marking was temporarily unavailable, an existing pending/uploading claim remains a 409 until recovery resolves it. Completed receipts remain unchanged. No multi-controller/HA guarantee is added beyond the existing single-controller deployment.
+
+CLI uploads expose --idempotency-key and never silently generate keys or automatically retry requests. The live idempotency verifier checks API/CLI replay, conflict rejection, controller restart persistence, byte integrity and receipt retention after physical deletion.

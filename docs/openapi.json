@@ -158,9 +158,39 @@
               "application/json": {
                 "schema": {}
               }
+            },
+            "headers": {
+              "Idempotency-Replayed": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "true",
+                    "false"
+                  ]
+                },
+                "description": "Present on keyed uploads; true when returning the saved response."
+              }
             }
+          },
+          "409": {
+            "description": "Conflicting key or upload still in progress"
+          },
+          "410": {
+            "description": "Original keyed upload was deleted"
           }
         },
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+            },
+            "description": "Reuse for identical upload retries; conflicting requests return 409, deleted originals return 410."
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {

@@ -55,7 +55,7 @@ Downloads stream to a temporary file beside the destination. The client checks e
 ./store download OBJECT_ID -o report.pdf --force
 ```
 
-The destination directory must already exist. The client needs temporary disk space for the complete download. Uploads stream from the input file through HTTPX multipart encoding. Upload POSTs are not automatically retried: without server-side idempotency keys, an ambiguous reply can correspond to an already completed upload. Inspect `list` before retrying manually.
+The destination directory must already exist. The client needs temporary disk space for the complete download. Uploads stream from the input file through HTTPX multipart encoding. Upload POSTs are not automatically retried. Supply `--idempotency-key YOUR_UNIQUE_KEY` and reuse that key with the identical file/name/type/metadata when retrying an ambiguous response. Without a key, inspect `list` before retrying because another complete object could be created.
 
 ## Configuration and automation
 
@@ -78,3 +78,15 @@ Global options work before or after the command. `--url` overrides `STORE_URL`; 
 ```
 
 The live checker uses the local controller, exercises every command, verifies binary bytes and checksums independently, and deletes only its own temporary object. It does not inject faults or stop containers.
+
+## Upload idempotency keys
+
+```bash
+./store upload report.pdf --meta owner=student --idempotency-key report-001
+# If the reply is lost, run the identical command again.
+./store upload report.pdf --meta owner=student --idempotency-key report-001
+```
+
+The retry returns the same object ID and saved original response, even after controller restart. Use a new key for a different intended object. A key is case-sensitive and contains 1–128 ASCII letters/digits, dots, underscores, colons or hyphens. Changed bytes, filename, content type or custom metadata with the same key produce 409. Matching retries after deletion produce 410. Keys and completed receipts are retained; there is no expiry/recycling. Failed unpublished attempts may retry with the same payload/key, and an in-progress 409 can be retried later.
+
+The saved response is a creation-time snapshot, so later PATCH/repair activity does not alter it. Use `metadata`, `placements` or `status` for current state. The whole upload is resent on retry; no resumable-transfer protocol or automatic retry loop is implied.

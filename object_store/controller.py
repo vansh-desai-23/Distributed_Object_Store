@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from uuid import UUID
 from sqlalchemy import select, text
@@ -20,6 +20,7 @@ from object_store.common import canonical_id, install_errors, validate_metadata
 from object_store.database import make_database
 from object_store.models import Chunk, StoredObject, Worker, RepairJob, now
 from object_store.service import Store
+from object_store.idempotency import validate_key
 from object_store.membership import Registry
 
 log = logging.getLogger(__name__)
@@ -128,6 +129,13 @@ def create_app(database_url=None, transport=None, background=True, allowed_worke
                 "repair_jobs": jobs}
 
     @app.post("/api/v1/objects", status_code=201, openapi_extra={
+        "parameters": [{"name": "Idempotency-Key", "in": "header", "required": False,
+                        "schema": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+                        "description": "Reuse for identical upload retries; conflicting requests return 409, deleted originals return 410."}],
+        "responses": {"201": {"headers": {"Idempotency-Replayed": {"schema": {"type": "string", "enum": ["true", "false"]},
+                          "description": "Present on keyed uploads; true when returning the saved response."}}},
+                      "409": {"description": "Conflicting key or upload still in progress"},
+                      "410": {"description": "Original keyed upload was deleted"}},
         "requestBody": {"required": True, "content": {"multipart/form-data": {"schema": {
             "type": "object", "required": ["file"], "properties": {
                 "file": {"type": "string", "format": "binary"},
@@ -135,6 +143,10 @@ def create_app(database_url=None, transport=None, background=True, allowed_worke
                              "description": "JSON object containing custom string key-value pairs"}
             }}}}}})
     async def upload(request: Request):
+        keys = request.headers.getlist('idempotency-key')
+        if len(keys) > 1:
+            raise HTTPException(400, 'Provide exactly one Idempotency-Key header')
+        key = validate_key(keys[0]) if keys else None
         if not request.headers.get("content-type", "").startswith("multipart/form-data"):
             raise HTTPException(400, "Upload requires multipart/form-data")
         async with request.form(max_files=1, max_fields=1, max_part_size=250_000) as form:
@@ -147,6 +159,10 @@ def create_app(database_url=None, transport=None, background=True, allowed_worke
                 metadata = validate_metadata(json.loads(form.get("metadata", "{}")))
             except (ValueError, TypeError):
                 raise HTTPException(400, "Metadata must be a JSON object of string pairs") from None
+            if key is not None:
+                result, replayed = await store.idempotency.upload(file, metadata, key)
+                return JSONResponse(result, status_code=201,
+                                    headers={'Idempotency-Replayed': str(replayed).lower()})
             result = await store.upload(file, metadata)
         return result
 

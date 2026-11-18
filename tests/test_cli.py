@@ -170,3 +170,23 @@ def test_invalid_controller_url_is_a_clean_error():
     code, output, errors = invoke(['--url', 'http://localhost:bad', 'status'], handler)
     assert code == 1 and not output and errors.startswith('Error:')
     assert 'Traceback' not in errors
+
+
+def test_upload_passes_explicit_idempotency_key(tmp_path):
+    path = tmp_path / 'source.bin'
+    path.write_bytes(DATA)
+    def keyed(request):
+        assert request.headers['idempotency-key'] == 'cli-request-123'
+        return httpx.Response(201, json=META, headers={'Idempotency-Replayed': 'true'})
+    code, output, errors = invoke(['upload', str(path), '--idempotency-key', 'cli-request-123', '--json'], keyed)
+    assert code == 0 and not errors and json.loads(output)['object_id'] == OBJECT
+
+
+def test_explicit_empty_upload_key_is_not_silently_omitted(tmp_path):
+    path = tmp_path / 'source.bin'
+    path.write_bytes(DATA)
+    def invalid(request):
+        assert 'idempotency-key' in request.headers and request.headers['idempotency-key'] == ''
+        return httpx.Response(400, json={'error': {'message': 'Invalid idempotency key'}})
+    code, _, errors = invoke(['upload', str(path), '--idempotency-key', '', '--json'], invalid)
+    assert code == 1 and '400' in errors

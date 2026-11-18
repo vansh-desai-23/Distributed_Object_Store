@@ -88,3 +88,15 @@ class DamageReceipt(Base):
     event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     worker_id: Mapped[str] = mapped_column(String(64))
     storage_id: Mapped[str] = mapped_column(String(36))
+
+
+class UploadReceipt(Base):
+    __tablename__ = 'upload_receipts'
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    # Deliberately retained after physical object deletion; keys are never recycled.
+    object_id: Mapped[str] = mapped_column(String(36), unique=True)
+    state: Mapped[str] = mapped_column(String(16))
+    response: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    __table_args__ = (CheckConstraint("state IN ('pending', 'completed', 'failed')"),)
