@@ -1,4 +1,4 @@
-"""Phase 4: durable lifecycle intents, late requests, and concurrency boundaries."""
+"""durable lifecycle intents, late requests, and concurrency boundaries."""
 import asyncio
 from uuid import uuid4
 

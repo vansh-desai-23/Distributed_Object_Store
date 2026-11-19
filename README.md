@@ -21,18 +21,6 @@ Use `./store` for a clean terminal interface (the launcher uses your project `.v
 
 Downloads are size/SHA-256 verified before saving the final file. Existing destinations require `--force`. Add `--json` for scripts, `--url` for another controller, or `--help` for command options. See [docs/cli.md](docs/cli.md) for the complete guide.
 
-## Submission guide
-
-See [docs/submission.md](docs/submission.md) for the presentation sequence, requirement-to-evidence mapping, fresh-deployment verification, packaging instructions and known limitations. The required backend covers original Phases 1–7; the optional custom frontend remains deferred. Reliability upgrade Phases 1–2 (safe membership, local integrity and durable repair) are implemented. Reliability upgrade Phase 3 adds the operational CLI, complete chunk-boundary coverage and refreshed submission packaging. Regenerate archives in `dist/` after any subsequent changes.
-
-To create the source submission archive after validation:
-
-```bash
-python3 final_demo/build_submission.py
-```
-
-Output: `dist/mini-distributed-object-store.zip`, with source checksums inside and an archive checksum alongside it. No Git commit or push is performed.
-
 ## Start
 
 Prerequisites: Docker Engine with Compose; Python 3.12+ for local tests/demo.
@@ -74,11 +62,6 @@ whole cluster, although only this run's objects are corrupted/deleted. It restor
 containers and removes its data even after an error or Ctrl+C, reports cleanup failures,
 and exits nonzero on failure. No Docker volumes are removed.
 
-The former `scripts/check_*.py` acceptance clients have been removed. Boundary tests,
-operation races, interrupted writes, and other exhaustive checks remain in `tests/`;
-the presentation is deliberately focused. `final_demo/verify_fresh.py` remains a separate
-isolated clean-install check, and `final_demo/build_submission.py` packages the source.
-
 ## Use the API
 
 ```bash
@@ -110,7 +93,7 @@ Compare `sha256sum` to the metadata's whole-object checksum. Metadata also shows
 
 These tests retain chunk boundaries, stale operations, interrupted writes, concurrency,
 worker membership, integrity, lifecycle, CLI and upload-idempotency coverage independently
-of the presentation. See [docs/validation.md](docs/validation.md) for observed results.
+of the presentation.
 
 ## Stop and restart
 
@@ -126,16 +109,16 @@ docker compose up -d --wait
 
 ## Design and boundaries
 
-See [design.md](docs/design.md) for Phase 1 decisions, schema, complete REST contracts, state transitions, recovery policies, and acceptance criteria. See [validation.md](docs/validation.md) for actual verification results. [AGENT.md](AGENT.md) records prompt-driven changes and exact code-file responsibilities.
+See [design.md](docs/design.md) for the architecture, schema, REST contracts, state transitions, recovery policies, and acceptance criteria.
 
 - One controller process only. Do not add Uvicorn workers or controller replicas: lifecycle locks are intentionally process-local.
 - Replication protects against a worker process failure; a single-host system cannot tolerate loss of its physical disk or metadata database.
 - Checksums are verified before each chunk is returned. If all copies of a later chunk fail after download headers were sent, the stream terminates; clients must verify size/checksum.
 - Downloads already in progress hold an object lock; deletion waits for those downloads before committing logical removal.
 - PostgreSQL owns metadata; persistent filesystem volumes own binary data. No Kafka, gRPC, Kubernetes, or leader election is needed for this topology.
-- Authentication, TLS, high availability of the controller/database, backups, and resumable transfers are outside this local coursework implementation. The optional frontend remains deferred.
+- Authentication, TLS, high availability of the controller/database, backups, and resumable transfers are outside this local coursework implementation.
 
-## Durable integrity and repair (reliability upgrade Phase 2)
+## Durable integrity and repair
 
 Workers use Python's built-in SQLite module for a small `catalog.sqlite` file inside their existing data volume. PostgreSQL remains the controller database, and the deployment still has six containers. This adds durable local metadata, not another database service.
 

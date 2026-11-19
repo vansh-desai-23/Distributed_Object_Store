@@ -1,4 +1,4 @@
-"""Phase 6: corruption detection, authoritative hashes, and safe repair."""
+"""corruption detection, authoritative hashes, and safe repair."""
 import asyncio
 import json
 from uuid import uuid4

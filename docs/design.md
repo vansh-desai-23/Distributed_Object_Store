@@ -178,21 +178,21 @@ This is a local teaching system. Full inventories and metadata/list responses ar
 | Storage unavailable | One-worker upload rejection and simulated ENOSPC tests |
 | REST validation and retries | Invalid metadata/UUID/registration, PUT conflict, repeat DELETE tests |
 
-Run commands and recorded results are in README.md and validation.md. Phase 1 is complete; subsequent implementation is present in the repository.
+Run commands are in README.md. Automated tests and the guided demonstration provide executable verification.
 
-## Reliability upgrade Phase 1: membership contract
+## Worker membership contract
 
 The selected design follows TEAM-PLAN cards A2/B3/A5: stable storage identity, fresh boot identity, inventory before eligibility, and safe excess-copy reconciliation. PostgreSQL and the existing service boundary remain in use.
 
 `worker.identity` is atomically persisted and fsynced separately from chunk manifests; it binds the volume to the configured service name. Each app process gets a fresh boot UUID. Corrupt identity files fail startup instead of silently generating a replacement. Migration 0002 preserves existing objects and replica rows, adds membership fields, and makes legacy workers/replicas ineligible/pending until registration and inventory finish. Legacy worker volumes create their first storage UUID during upgrade.
 
-Registration probes the configured worker health endpoint to reject delayed reports from an old boot. A different volume UUID for an already bound service is rejected and disables eligibility; automated volume replacement is outside this phase. Registration or heartbeat expiry advances a durable membership version and invalidates replica health. Heartbeats from a different boot must register. Maintenance retries reconciliation, checks object state under existing object locks, and only enables a worker when its boot and membership version still match. An inventory failure leaves it ineligible; database state survives controller restart. A final health probe detects a worker restart during inventory.
+Registration probes the configured worker health endpoint to reject delayed reports from an old boot. A different volume UUID for an already bound service is rejected and disables eligibility; automated volume replacement is unsupported. Registration or heartbeat expiry advances a durable membership version and invalidates replica health. Heartbeats from a different boot must register. Maintenance retries reconciliation, checks object state under existing object locks, and only enables a worker when its boot and membership version still match. An inventory failure leaves it ineligible; database state survives controller restart. A final health probe detects a worker restart during inventory.
 
-Controller chunk requests carry expected storage/boot headers; workers reject a mismatched incarnation, and replies from a superseded membership version are discarded. These are membership guards; per-operation sequencing and durable write receipts are implemented in upgrade Phase 2 below. Direct internal diagnostic calls may omit these headers on the trusted local Docker network.
+Controller chunk requests carry expected storage/boot headers; workers reject a mismatched incarnation, and replies from a superseded membership version are discarded. These are membership guards; per-operation sequencing and durable write receipts are described below. Direct internal diagnostic calls may omit these headers on the trusted local Docker network.
 
 Worker readiness requires a recent successful controller report confirming eligibility; loss of contact clears readiness. Compose uses `/ready` for workers and `/health` for the controller, avoiding a startup dependency cycle. Inventory is currently a full list and one checksum pass under the worker disk lock, with bounded chunk reads but metadata memory proportional to local chunk count. Large inventories may require longer request timeouts; routine integrity scanning is separate, bounded, persisted and worker-local as described below. Exactly one worker process may own each volume, and one controller process owns lifecycle coordination.
 
-## Reliability upgrade Phase 2: durable integrity and repair
+## Durable integrity and repair
 
 This follows TEAM-PLAN B2/B4/A5: a worker catalog with receipts, fixed-order local scans with persistent progress, retained/repeated damage reports, and a serial coalesced repair queue. Python's standard-library SQLite is added for worker-local relational state; PostgreSQL remains the authoritative object/membership database. No broker or additional container is introduced.
 
@@ -222,13 +222,13 @@ Operational views: controller status includes last reported per-worker scan prog
 
 No automatic receipt/high-water/tombstone garbage collection is implemented. Restoring an old metadata database independently of worker catalogs can roll back controller sequencing and is unsupported; preserve both together. Single-controller/single-process-per-volume and trusted internal-network assumptions remain. These mechanisms protect ordering and recovery, not loss of both replicas or physical-host loss.
 
-## Reliability upgrade Phase 3: operational client and submission
+## Operational client and verification
 
 `object_store.cli` provides upload, verified download, paginated list, metadata, PATCH, DELETE, status, placement, scan and repair inspection. The executable `store` launcher preserves the caller's working directory and chooses the project virtual environment when available. The client uses existing HTTPX plus standard-library argparse; no new dependency or service is needed. Output uses simple aligned columns; JSON mode supports scripts.
 
 Downloads stream to an adjacent temporary file, verify exact metadata size/SHA-256, fsync file contents and publish atomically. Default publication refuses an existing destination, including a concurrent creation; explicit --force replaces only after verification. Failed/cancelled transfers remove temporary files. Uploads stream multipart content and are not automatically retried. Optional public upload idempotency is implemented as described below.
 
-Unit/integration boundary cases cover 0, 1, C−1, C, C+1, 2C, 2C+1 and 2.5 MB. The guided presentation uses a multi-chunk binary object with a partial final chunk; exhaustive boundary cases remain in the automated suite. CLI tests cover HTTP contracts, pagination, read-only inspection, JSON/errors, metadata parsing, control-character sanitization, verified downloads, overwrite protection and interrupted/corrupt transfers. `final_demo/demo.py` presents the live system and includes operational CLI metadata inspection. Final evidence and fresh 100/500 MB deployment results are recorded in validation.md; packaging includes the executable launcher and verifies every source member/checksum.
+Unit/integration boundary cases cover 0, 1, C−1, C, C+1, 2C, 2C+1 and 2.5 MB. The guided presentation uses a multi-chunk binary object with a partial final chunk; exhaustive boundary cases remain in the automated suite. CLI tests cover HTTP contracts, pagination, read-only inspection, JSON/errors, metadata parsing, control-character sanitization, verified downloads, overwrite protection and interrupted/corrupt transfers. `final_demo/demo.py` presents the live system and includes operational CLI metadata inspection. The CLI launcher and automated tests are included with the project.
 
 ## Upload idempotency contract
 

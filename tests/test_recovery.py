@@ -1,4 +1,4 @@
-"""Phase 5: failure detection, replica availability, and returning workers."""
+"""failure detection, replica availability, and returning workers."""
 from datetime import timedelta
 
 import pytest
