@@ -10,8 +10,7 @@ from uuid import uuid4
 
 import httpx
 
-from check_storage import ROOT, require
-from demo import wait_for
+from demo import ROOT, require, wait_for
 
 
 def run(*args, timeout=240):

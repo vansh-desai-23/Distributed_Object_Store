@@ -14,7 +14,7 @@ TOP_LEVEL = (
 def main():
     sources = [ROOT / name for name in TOP_LEVEL]
     for directory, extensions in (
-        ('object_store', {'.py'}), ('migrations', {'.py'}), ('scripts', {'.py'}),
+        ('object_store', {'.py'}), ('migrations', {'.py'}), ('final_demo', {'.py'}),
         ('tests', {'.py'}), ('docs', {'.md', '.json'}),
     ):
         sources.extend(path for path in (ROOT / directory).rglob('*')

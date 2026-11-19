@@ -74,10 +74,10 @@ Global options work before or after the command. `--url` overrides `STORE_URL`; 
 
 ```bash
 .venv/bin/pytest -q tests/test_cli.py
-.venv/bin/python scripts/check_cli.py
+.venv/bin/python final_demo/demo.py
 ```
 
-The live checker uses the local controller, exercises every command, verifies binary bytes and checksums independently, and deletes only its own temporary object. It does not inject faults or stop containers.
+The guided demo includes live CLI metadata inspection alongside API and physical-storage checks. It intentionally interrupts services and corrupts only its own data. Full CLI command/error coverage remains in the automated tests.
 
 ## Upload idempotency keys
 
