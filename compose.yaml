@@ -1,7 +1,7 @@
 name: mini-object-store
 x-worker: &worker
-  build: .
-  image: mini-object-store:local
+  image: &app-image mini-object-store:local
+  pull_policy: never
   restart: unless-stopped
   depends_on:
     controller:
@@ -29,7 +29,8 @@ services:
     restart: unless-stopped
   controller:
     build: .
-    image: mini-object-store:local
+    image: *app-image
+    pull_policy: build
     command: ["sh", "-c", "alembic upgrade head && exec uvicorn object_store.controller:create_app --factory --host 0.0.0.0 --port 8000"]
     environment:
       DATABASE_URL: postgresql+psycopg://store:store@postgres/store

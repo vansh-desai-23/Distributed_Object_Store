@@ -82,7 +82,7 @@ The UTF-8 setting lets the guided demo print its Unicode status symbols in a Win
 ./store delete OBJECT_ID
 ```
 
-Replace `OBJECT_ID` with the UUID returned by upload. On Windows, replace `./store` with `.\.venv\Scripts\python.exe -m object_store.cli`. Downloads are checked against the stored size and SHA-256 before the destination file is published. Use `--force` only when you intend to replace an existing destination.
+Replace `report.pdf` with your file and `OBJECT_ID` with the UUID returned by upload. On Windows, replace `./store` with `.\.venv\Scripts\python.exe -m object_store.cli`. Downloads are checked against the stored size and SHA-256 before the destination file is published. Use `--force` only when you intend to replace an existing destination.
 
 See [the CLI guide](docs/cli.md) for every command, JSON output, inspection tools, and safe retry behavior.
 
@@ -94,7 +94,7 @@ See [the CLI guide](docs/cli.md) for every command, JSON output, inspection tool
 | `GET` | `/api/v1/objects/{object_id}` | Download the original binary object |
 | `GET` | `/api/v1/objects/{object_id}/metadata` | Read system and custom metadata |
 | `PATCH` | `/api/v1/objects/{object_id}/metadata` | Merge custom metadata without re-uploading |
-| `DELETE` | `/api/v1/objects/{object_id}` | Remove public visibility; returns 204 |
+| `DELETE` | `/api/v1/objects/{object_id}` | Hide the object immediately and return 204. Background cleanup removes stored copies when workers are available. |
 | `GET` | `/api/v1/objects` | List objects with `offset` and `limit` |
 | `GET` | `/api/v1/status` | Inspect workers, scan progress, cleanup, and repairs |
 
@@ -110,13 +110,14 @@ The response includes the object ID, whole-object checksum, ordered chunks, and 
 
 ## Run the demonstration
 
-Start the services first, then run:
+From the repository root, start the cluster and launch the guided demo:
 
 ```bash
+docker compose up -d --build --wait
 .venv/bin/python final_demo/demo.py
 ```
 
-The demo pauses between seven stages. It verifies the six-container deployment, binary round trip, chunk distribution and physical copies, metadata, worker stop/restart, intentional corruption and repair, upload replay across a controller restart, and final cleanup. It announces each fault command before running it and restores the affected services. Its default object is 100 MB plus a 19-byte final chunk.
+Press Enter at each stage. A successful run ends with `ALL DEMO STAGES PASSED`. It verifies the six-container deployment, binary round trip, chunk distribution and physical copies, metadata, `worker2` stop/restart, intentional corruption and repair, upload replay across a controller restart, and final cleanup. It announces each fault command before running it and restores the affected services. Its default object is 100 MB plus a 19-byte final chunk.
 
 For a quick unattended rehearsal:
 
@@ -131,8 +132,7 @@ On Windows PowerShell, run `.\.venv\Scripts\python.exe final_demo\demo.py --unat
 Run the automated suite in Linux, where the worker's durable filesystem operations are supported:
 
 ```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+.venv/bin/python -m pytest -q
 ```
 
 The suite covers chunk boundaries, API behavior, worker membership, concurrent lifecycle operations, interrupted writes, integrity scanning, repair, CLI behavior, and upload idempotency. A native Windows run is not supported because the worker uses Linux directory `fsync` semantics. Docker is the intended runtime.

@@ -173,7 +173,7 @@ class Demo:
     def run(self):
         with self.stage('Deployment and persistent storage'):
             ids = docker('compose', 'ps', '--all', '--quiet').split()
-            require(len(ids) == 6, 'Start the six services: docker compose up --build -d --wait')
+            require(len(ids) == 6, 'Start the six services: docker compose up -d --build --wait')
             containers = json.loads(docker('inspect', *ids))
             services = {c['Config']['Labels']['com.docker.compose.service']: c for c in containers}
             require(set(services) == WORKERS | {'controller', 'postgres'}, 'Unexpected topology')
@@ -253,11 +253,14 @@ class Demo:
             require(response.status_code == 201, 'Small upload failed')
             doomed = response.json()
             doomed_ids = {c['chunk_id'] for c in doomed['chunks']}
-            worker = doomed['chunks'][0]['replicas'][0]['worker_id']
+            worker = 'worker2'
+            inventory = worker_get(worker, f'/internal/workers/{worker}/chunks')['body']['chunks']
+            require(any(item['chunk_id'] in doomed_ids and item['valid'] for item in inventory),
+                    'worker2 must hold a copy of the offline-deletion object before shutdown')
             before_worker = next(w for w in self.status() if w['worker_id'] == worker)
-            print(f'Running: docker compose stop {worker}')
+            print(f'Running: docker stop {worker}')
             self.stopped.add(worker)
-            docker('compose', 'stop', worker)
+            docker('stop', worker)
             self.download(identity, expected, size)
             wait_for(lambda: not next(w['available'] for w in self.status() if w['worker_id'] == worker), 'worker failure detected')
             wait_for(lambda: self.replicated(identity), 'two live replicas restored while worker is offline')
@@ -378,7 +381,7 @@ def main():
     print('Demo coverage', flush=True)
     for item in CHECKLIST:
         print(f'• {item}')
-    print('\nStart beforehand: docker compose up --build -d --wait\nThis demo pauses/restarts local services and cleans up only its own objects.\nWorker commands run automatically after each stage’s Enter prompt.', flush=True)
+    print('\nStart beforehand: docker compose up -d --build --wait\nThis demo pauses/restarts local services and cleans up only its own objects.\nWorker commands run automatically after each stage’s Enter prompt.', flush=True)
     failed = False
     with tempfile.TemporaryDirectory(prefix='store-demo-') as directory, httpx.Client(base_url='http://127.0.0.1:8000', timeout=300, trust_env=False) as client:
         demo = Demo(args, client, directory)
