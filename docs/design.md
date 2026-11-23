@@ -1,247 +1,144 @@
-# Backend architecture and implemented contract
+# System design
 
-This is the finalized baseline for the local coursework deployment. The implementation follows this design; limitations are explicit below.
+This document describes the implemented single-host object store. The [README](../README.md) covers setup and demonstration; the [CLI guide](cli.md) covers day-to-day commands.
 
-## Architecture and ownership
+## Architecture
 
 ```mermaid
 flowchart LR
-    C[Client: curl or Python] -->|REST, multipart upload, binary download| A[Controller: FastAPI]
-    A -->|Metadata transactions| DB[(PostgreSQL)]
-    A -->|Chunk REST APIs| W1[Worker 1]
-    A -->|Chunk REST APIs| W2[Worker 2]
-    A -->|Chunk REST APIs| W3[Worker 3]
-    A -->|Chunk REST APIs| W4[Worker 4]
-    W1 --> V1[(Volume 1)]
-    W2 --> V2[(Volume 2)]
-    W3 --> V3[(Volume 3)]
-    W4 --> V4[(Volume 4)]
+    Client[REST or CLI client] -->|multipart upload and binary download| Controller[Controller]
+    Controller -->|metadata transactions| DB[(PostgreSQL)]
+    Controller -->|internal chunk requests| W1[Worker 1]
+    Controller -->|internal chunk requests| W2[Worker 2]
+    Controller -->|internal chunk requests| W3[Worker 3]
+    Controller -->|internal chunk requests| W4[Worker 4]
+    W1 --> V1[(Persistent volume)]
+    W2 --> V2[(Persistent volume)]
+    W3 --> V3[(Persistent volume)]
+    W4 --> V4[(Persistent volume)]
 ```
 
-- Exactly one controller process owns all metadata and coordinates placement, reads, cleanup, and repair. Run one Uvicorn process; in-process object locks are intentionally sufficient only for this topology.
-- Four containers run the same worker code. Workers own chunk files and checksum manifests, and register/heartbeat to the controller. A worker does not access PostgreSQL.
-- PostgreSQL stores metadata, never object bytes. Its Docker volume survives container recreation.
-- Six long-running containers: controller, four workers, and PostgreSQL. No Kubernetes, external cloud service, broker, gRPC, or leader-election service.
-- Only controller port 8000 is published, on loopback. Worker URLs are a fixed membership allowlist, preventing arbitrary registration destinations. Internal endpoints are intended for a trusted local Compose network, not a public multi-tenant deployment.
-- Default local database credentials are development credentials. Authentication, TLS termination, authorization, backups, controller HA, and Internet deployment are outside the submission baseline.
+The FastAPI controller owns object metadata, placement, reads, deletion, worker membership, and repair. PostgreSQL stores the authoritative metadata and repair state, not object bytes. Each worker stores chunk files and a local SQLite catalog in its own named volume. The controller is the only service published to the host, on `127.0.0.1:8000`. Worker and database traffic remains inside the Compose network.
 
-## Storage invariants
+The topology has one controller process and one process per worker volume. Controller object locks are process-local; adding controller replicas or extra Uvicorn workers would require distributed coordination.
 
-1. A chunk is at most **1,000,000 bytes**, interpreting MB as decimal. A final chunk may be smaller. Empty objects have zero chunks and SHA-256 of empty bytes.
-2. Object IDs and chunk IDs are independent UUID4 values. Original names are display metadata, never paths. Duplicate object names are allowed.
-3. Chunk positions are zero-based and unique within an object. Bytes are reassembled in position order.
-4. Normal operation targets exactly two valid replicas on distinct workers. A repair may temporarily create extra replicas; unavailable old replicas remain recorded until removable.
-5. Upload returns 201 only after each chunk has received two successful durable storage acknowledgments. This is an acknowledgment guarantee, not a promise that failures cannot occur immediately afterward.
-6. Controller SHA-256 values are authoritative. Workers validate local manifest structure, integer size in 1..1,000,000, lowercase 64-hex SHA-256, and a 4,096-byte manifest limit before verifying bytes. The controller independently verifies bytes against its own checksum before returning them; an altered file with a matching altered worker manifest is still rejected. Detected missing/invalid replicas are logged with object/chunk/worker identifiers.
-7. No partial object is visible through list, download, or metadata APIs.
-8. A storage operation's target is committed to the database before sending bytes. Lost replies leave discoverable cleanup/repair work.
-9. Never trim surplus replicas until two current copies have been read and verified.
+## Storage rules
 
-## Relational model
+1. Chunk size is 1,000,000 bytes (decimal 1 MB). The final chunk may be smaller. An empty object has zero chunks and the SHA-256 digest of empty bytes.
+2. Object and chunk IDs are separate UUIDs. A filename is display metadata, never a filesystem path; duplicate names are allowed.
+3. Zero-based chunk positions preserve byte order. Downloads stream chunks in that order.
+4. Normal operation targets two valid copies on distinct eligible workers. Temporary extra copies may exist during repair or reconciliation.
+5. Upload publishes an object only after two durable worker acknowledgments per chunk. Partial uploads remain invisible to list, metadata, and download.
+6. The controller's size and SHA-256 values are authoritative. Workers validate their local files and manifests, and the controller independently checks bytes returned by workers.
+7. A replica destination is recorded before a network write. Uncertain replies therefore leave a durable target for later reconciliation or cleanup.
 
-| Table | Key and fields | Purpose and constraints |
-|---|---|---|
-| `objects` | UUID `id`; `name`, `size`, `content_type`, UTC `created_at`/`modified_at`, SHA-256 `checksum`, `chunk_count`, JSON `custom_metadata`, `state` | State is `uploading`, `available`, or `deleting`. JSON is a PostgreSQL relational-table column, not another database. |
-| `workers` | Service `id`; unique `url` and nullable unique `storage_id`; `boot_id`, `eligible`, `membership_version`, `last_seen`, `free_bytes` | Controller timestamps heartbeats. Availability requires completed reconciliation and a fresh heartbeat. Free space is advisory, not a reservation. |
-| `chunks` | UUID `id`; FK `object_id`, `position`, `size`, `checksum` | Unique `(object_id, position)`; size in 1..1,000,000. |
-| `replicas` | Composite PK `(chunk_id, worker_id)`; FKs; `state` | `pending` (write intent or currently unverified copy), `healthy` (last verified/acknowledged), or `bad` (proven missing/corrupt); row existence also records a potential physical copy after a lost response. |
+## Metadata model
 
-An Alembic migration creates the schema. Explicit deletion order is replicas, chunks, then objects. Pending work is represented by lifecycle and replica rows, so a separate broker/job table is unnecessary. Metadata PATCH merges a copied dictionary under the object lock, preserving unrelated keys.
+| Table | Key fields | Role |
+| --- | --- | --- |
+| `objects` | UUID, name, size, content type, timestamps, SHA-256, chunk count, JSON custom metadata, lifecycle state | Object identity and visibility |
+| `chunks` | UUID, object ID, position, size, SHA-256 | Ordered object content |
+| `replicas` | Chunk ID, worker ID, state | Known and possible physical copies |
+| `workers` | Worker ID, URL, storage and boot IDs, membership version, eligibility, heartbeat | Worker identity and availability |
+| `repair_jobs` | Chunk ID, revision, reason, attempts, last error | Durable repair intent |
+| `worker_operations` and `operation_clock` | Worker/chunk target and increasing sequence | Ordered mutations and retry protection |
+| `damage_receipts` | Damage event ID | Deduplicated worker reports |
+| `upload_receipts` | Idempotency key, fingerprint, object ID, state, response | Upload replay across restarts |
 
-## Public REST API
+PostgreSQL migrations live in `migrations/` and run before the controller starts. Object states are `uploading`, `available`, and `deleting`. Replica states are `pending`, `healthy`, and `bad`. A `healthy` state records the latest successful verification or acknowledgment; it is not a continuous claim about disk contents. Reads and scans recheck integrity.
 
-All errors before streaming begins use `{"error":{"message":"..."}}`; validation errors may add `details`. Invalid inputs use 400, missing/invisible objects 404, unavailable storage/database 503, unexpected failures 500. IDs must be valid UUID strings; malformed IDs use 400. Client object bytes are immutable after creation.
+Each worker volume also contains a SQLite `catalog.sqlite` with trusted expected size/hash, mutation receipts, scan progress, and retained damage events. This is local worker state, not another service or a replacement for PostgreSQL.
 
-| Method and path | Request | Successful result |
-|---|---|---|
-| `POST /api/v1/objects` | `multipart/form-data`; required binary `file`; optional `metadata` field containing a JSON string-to-string object | 201; full object metadata including chunks and replica locations |
-| `GET /api/v1/objects/{object_id}` | None | 200; original binary bytes, stored Content-Type, Content-Length, attachment filename, `X-Object-Checksum` |
-| `GET /api/v1/objects/{object_id}/metadata` | None | 200; object/system/custom metadata and chunk locations |
-| `PATCH /api/v1/objects/{object_id}/metadata` | JSON string-to-string map | 200; updated full metadata. Adds/replaces custom keys; does not remove keys or modify stored bytes. |
-| `DELETE /api/v1/objects/{object_id}` | None | 204 after committing logical deletion; physical cleanup is asynchronous |
-| `GET /api/v1/objects?offset=0&limit=100` | Offset >=0, limit 1..1000 | 200; `{objects: [...], offset, limit}`; each item has object_id, name, size, content_type |
-| `GET /api/v1/status` | None | 200; worker availability/last_seen/free_bytes, pending cleanup count, replication factor |
-| `GET /health` | None | 200 when controller can query PostgreSQL; otherwise 503 |
+## Client API
 
-Metadata rules: at most 100 keys, each 1..128 characters, string values up to 2048 characters. Names are at most 255 characters and stripped of path prefixes. Missing Content-Type defaults to application/octet-stream. The multipart parser permits one file and one ordinary field. No arbitrary 100 MB or 500 MB application limit is imposed; disk capacity is the practical bound.
+Structured responses use JSON. Binary downloads use the stored content type. Errors raised before streaming starts use `{"error":{"message":"..."}}`; validation errors may include `details`.
 
-Metadata response example (abbreviated):
+| Method | Path | Request and success response |
+| --- | --- | --- |
+| `POST` | `/api/v1/objects` | Multipart `file`, optional JSON-string `metadata`; 201 with object metadata |
+| `GET` | `/api/v1/objects/{object_id}` | 200 binary, original content type, content length, checksum header |
+| `GET` | `/api/v1/objects/{object_id}/metadata` | 200 with system metadata, chunks, replicas, and custom metadata |
+| `PATCH` | `/api/v1/objects/{object_id}/metadata` | JSON string-to-string map; 200 updated metadata |
+| `DELETE` | `/api/v1/objects/{object_id}` | 204 after logical deletion commits |
+| `GET` | `/api/v1/objects?offset=0&limit=100` | 200 paginated object summaries |
+| `GET` | `/api/v1/status` | 200 worker, cleanup, scan, and repair status |
 
-```json
-{
-  "object_id": "55ec264b-06a2-4414-9583-48058f2beab1",
-  "name": "demo.bin",
-  "size": 1000001,
-  "content_type": "application/octet-stream",
-  "created_at": "2026-11-13T12:00:00+00:00",
-  "modified_at": "2026-11-13T12:00:00+00:00",
-  "checksum": "<whole-object SHA-256>",
-  "chunk_count": 2,
-  "chunk_size": 1000000,
-  "metadata": {"owner": "student"},
-  "chunks": [{
-    "chunk_id": "09778879-b8c5-46b2-89ab-92aa9e188ae6",
-    "position": 0,
-    "size": 1000000,
-    "checksum": "<chunk SHA-256>",
-    "replicas": [
-      {"worker_id": "worker1", "state": "healthy", "available": true},
-      {"worker_id": "worker2", "state": "healthy", "available": true}
-    ]
-  }]
-}
-```
+Invalid requests return 400, missing or invisible objects return 404, conflicts return 409, unavailable required storage or metadata returns 503, and unexpected failures return 500. Keyed upload replay after deletion returns 410. Object IDs must be valid UUID strings. Custom metadata is limited to 100 string pairs, keys of 1–128 characters, and values of at most 2,048 characters. PATCH merges fields; it does not remove keys or rewrite object bytes.
 
-`healthy` means last known checksum-valid/acknowledged; `available` means reconciled and heartbeat-fresh. Neither is a real-time proof of disk integrity; reads and background scrubbing perform that verification.
+## Internal API
 
-## Internal REST API
+| Receiver | Method and path | Purpose |
+| --- | --- | --- |
+| Controller | `POST /internal/workers/register` | Register a configured worker and its storage/boot identity |
+| Controller | `POST /internal/workers/heartbeat` | Refresh availability and deliver damage reports |
+| Worker | `PUT /internal/chunks/{chunk_id}` | Persist a chunk with expected checksum and operation sequence |
+| Worker | `GET /internal/chunks/{chunk_id}` | Return a validated chunk; reject missing or corrupt data |
+| Worker | `DELETE /internal/chunks/{chunk_id}` | Remove a replica; permanent deletion blocks later resurrection |
+| Worker | `GET /internal/workers/{worker_id}/chunks` | Return inventory for reconciliation |
+| Worker | `GET /internal/scan` | Return local scan progress and pending damage events |
 
-| Receiver | Method/path | Contract |
-|---|---|---|
-| Controller | `POST /internal/workers/register` | `{worker_id, storage_id, boot_id, url, free_bytes}` matching configured membership; 200 acknowledgment |
-| Controller | `POST /internal/workers/heartbeat` | Same body; 200 with eligibility; unknown worker or new boot receives 404 and registers next |
-| Worker | `PUT /internal/chunks/{chunk_id}` | Raw bytes plus `X-Chunk-Checksum`; 200 `{chunk_id, checksum, size}` after durable write |
-| Worker | `GET /internal/chunks/{chunk_id}` | 200 binary plus `X-Chunk-Checksum`; 404 missing, 409 corrupt/incomplete |
-| Worker | `DELETE /internal/chunks/{chunk_id}` | 204 even when absent. `X-Delete-Permanent: true` durably marks final deletion and rejects future PUTs with 409; ordinary repair/surplus removal omits it. |
-| Worker | `GET /internal/workers/{worker_id}/chunks` | 200 inventory with storage/boot IDs, chunk IDs and validity, hashes and sizes for valid files; 404 for another worker identity |
-| Worker | `GET /health` | 200 service/storage/boot identity and process status; not eligibility |
-| Worker | `GET /ready` | 200 after recent controller-confirmed eligibility; otherwise 503 |
+Worker URLs are checked against the configured four-member allowlist. The internal API assumes a trusted local Compose network; it is not a public multi-tenant interface.
 
-PUT with the same ID/content is repeatable. Different content under an existing ID is 409. Repair of a corrupt manifest first deletes that replica, while holding verified replacement bytes obtained from a valid source, then stores the expected bytes. Public POST optionally accepts Idempotency-Key for durable replay as specified below; retries without a key may create another complete object. Repeated public DELETE returns 404 after the first succeeds, but does not change the final state; this remains idempotent behavior.
-
-## Lifecycle and request flows
+## Request lifecycle
 
 ### Upload
 
-1. Bound concurrent multipart ingestion to two requests, check upload-spool free space, parse and validate metadata/file.
-2. Require two reconciled, heartbeat-fresh workers. Create an invisible `uploading` object and hold its lock.
-3. Read at most 1 MB from the spooled upload, update whole-object SHA-256, and persist the chunk description.
-4. Choose workers by fewest recorded replicas, with stable worker-ID tie breaking. Skip unavailable workers and those reporting less than chunk size + 10 MB free. Distinct workers only.
-5. Commit a `pending` replica destination before each PUT. Worker writes a temporary file, flushes/fsyncs it, atomically renames, and fsyncs the directory; does the same for its manifest before acknowledgment.
-6. Mark each matching acknowledgment `healthy`. Try other workers if a candidate fails. After every chunk has two acknowledgments, publish `available` with final size/count/hash in one transaction.
-7. On failure or cancellation mark `deleting`; periodic cleanup removes every recorded target. If the database itself is unavailable, preserve the original upload failure and leave the `uploading` intent. Once its object lock is released, maintenance converts it to `deleting` when the database recovers; startup recovery also handles it after restart. Active uploads hold their lock throughout and are never reclaimed.
+1. The controller bounds concurrent multipart ingestion to two requests, checks available spool space, and validates the file and custom metadata.
+2. It creates an invisible `uploading` object, reads at most one chunk at a time, and records each chunk's position, size, and checksum.
+3. Placement chooses eligible workers with distinct IDs, considering recorded load and reported free space. A `pending` destination is committed before each PUT.
+4. A worker records the operation, writes a temporary file, flushes it, atomically renames it, and acknowledges the write. The controller verifies a returned copy before marking placement healthy.
+5. When every chunk has two valid copies, the controller commits the `available` state and final object checksum. Failure or cancellation leaves durable cleanup work; no partial object becomes visible.
 
-Worker data files are `/data/<uuid>.chunk` and `/data/<uuid>.json`. Final deletion adds an empty, fsynced `/data/<uuid>.deleted` marker before removing those data files. Workers reject PUT/GET for a marked ID; startup finishes removal of data left behind after a marked deletion was interrupted. The marker survives restart and is not exposed as a stored chunk in inventory. Uncommitted `*.tmp` files are removed on worker startup. There is no deduplication or overwrite of object content.
+The whole upload is spooled to the controller's persistent `/tmp` volume by multipart handling. Object bytes are not stored in PostgreSQL. Empty objects are supported without creating an empty chunk.
 
 ### Download
 
-1. Acquire a download slot (four maximum) and object lock. Load only an available object and ordered chunk metadata.
-2. Fetch and verify the first chunk before starting the response, allowing a clean 503 if immediately unrecoverable.
-3. For each subsequent chunk try healthy eligible/fresh candidates first, then other eligible/fresh recorded copies. Expired and unreconciled workers are excluded. Validate size and controller checksum before yielding bytes.
-4. Mark proven corrupt/missing copies bad; background repair follows. Network failure alone does not prove corruption.
-5. Release the lock/slot on success, exception, or client disconnect. If a later chunk is unrecoverable, terminate the stream; its already-sent 200 cannot become a JSON 503. Content-Length and final SHA-256 allow clients to reject incomplete downloads.
+The controller loads an available object's ordered chunks under its object lock, fetches and verifies the first chunk before sending a 200 response, then streams subsequent chunks. It tries another eligible recorded replica if a copy is missing or corrupt. A proven bad copy creates repair intent; a network error alone does not prove corruption.
 
-The complete object is never assembled in memory or a download temporary file. Chunk metadata scales with chunk count. Each stream's bytes are bounded to chunk buffers rather than object size.
+The complete object is never assembled in memory. If all copies of a later chunk fail after response headers were sent, the stream ends early; clients must check length and SHA-256. The supplied CLI does this before publishing a downloaded file.
 
 ### Metadata update and deletion
 
-PATCH and DELETE serialize with uploads, downloads, and maintenance for the same object. An already-running download finishes or disconnects before DELETE acquires the lock. Once DELETE commits and returns 204, new requests see 404; existing bytes on offline workers are tracked until physical removal. Thus “immediate logical deletion” applies at the deletion commit, not at request arrival while a download holds the lock.
+PATCH, DELETE, downloads, and maintenance serialize per object. An in-progress download holds the object lock, so DELETE waits for that stream to finish or disconnect before committing logical deletion. After the 204 response, new public requests see 404. Physical deletion may continue while a worker is offline.
 
-Cleanup records destinations for every registered worker and sends idempotent permanent DELETE calls to available workers. Covering all workers prevents a delayed PUT from recreating a copy whose earlier surplus-location record was removed. Unavailable workers retain durable records; each pass may re-confirm deletion on already-cleaned workers until all workers acknowledge. Rows are removed only after acknowledged deletion; no object row is removed while any chunk/replica cleanup remains. Worker return cannot republish a deleted object.
+The controller tracks all possible worker destinations during cleanup. A worker records a durable permanent deletion marker before unlinking bytes and rejects later PUTs for that chunk ID. These markers prevent delayed writes from resurrecting a deleted object.
 
-A final DELETE persists its marker before unlinking bytes. If disk exhaustion prevents the marker write, it fails with 503 and the controller retains cleanup work until storage recovers. Repair deletes are non-permanent so valid bytes can be restored under the same chunk ID. Empty `.deleted` markers contain no object content but consume filesystem metadata/inodes. They are deliberately retained indefinitely in this bounded coursework system; safe garbage collection would require a bound on late requests or a stronger request-generation protocol.
+## Worker failure and recovery
 
-## Failure, repair, and restart policy
+Workers register at startup, then heartbeat every two seconds. The controller treats a worker as unavailable after a configurable timeout (10 seconds in Compose). Registration or a heartbeat after expiry moves its old replica states to pending verification. A restarted worker retains its volume identity but has a new boot ID; it is ineligible until inventory reconciliation and a current health probe complete.
 
-- Worker heartbeat interval: 2 seconds. Each worker explicitly registers on process startup, then sends heartbeats. Controller declares a worker unavailable after 10 seconds without a heartbeat. Explicit re-registration, or a heartbeat following expiry, changes its previously healthy replicas to pending verification. Normal timely heartbeats preserve verified state. These timing values are configurable.
-- HTTP connect timeout: 2 seconds; other per-operation timeout: 5 seconds; one retry after 0.1 seconds for network/server failures. A timeout can be ambiguous, hence durable destination intents.
-- Maintenance runs, then sleeps 3 seconds. Intervals are not hard recovery deadlines: work and timeouts extend a pass.
-- Each pass re-reads lifecycle state under the object lock, reclaims inactive `uploading` intents, inspects available objects for insufficient live healthy replicas, and cleans deleting objects. Busy objects are skipped to avoid conflicting writes/deletes.
-- Periodic integrity checks now run on each worker over at most 16 cataloged chunks per pass with persisted cursor/cycle boundaries. Each placement is checked independently against trusted expected values. The controller processes coalesced repair intents serially; repair/surplus verification may read additional chunks. A network timeout/server error leaves a copy pending verification (and never clears previously proven damage); only missing/corrupt responses or invalid returned bytes prove a bad copy. Reads performed before surplus removal also update the successful verification state.
-- If fewer than two valid live copies remain, fetch a valid source and store replacements on distinct available workers. When no valid copy is reachable, log the failure, preserve evidence, retry later, and return 503 on reads that have not started.
-- When workers return, explicit registration or a post-expiry heartbeat invalidates old healthy states to pending, so their retained copies must be verified before counting as healthy again. Pending/bad replicas are read; surplus deletion requires two verified copies. The controller obtains a complete checksum-verified inventory before eligibility. It compares entries with trusted chunk size/hash, marks missing or invalid recorded replicas bad, discovers matching extra copies, and permanently deletes unknown UUIDs. Deleting objects remain pending cleanup. It never replaces authoritative hashes with inventory values.
-- On controller startup convert all `uploading` objects to `deleting`, then resume periodic cleanup/repair. Worker heartbeats reestablish freshness. Available objects and metadata survive controller/container restart.
-- No guarantee against simultaneous loss/corruption of both copies, deletion of persistent volumes, host failure, or loss of the metadata database. Two containers on one physical disk provide process-failure isolation, not independent hardware durability.
+The controller compares worker inventory with authoritative chunk metadata. It handles missing, damaged, extra, or orphaned files without treating an old or mismatched volume as a valid replacement. Reads can continue from another valid copy during a worker outage. Repair copies valid bytes to an eligible distinct worker and verifies the replacement before reducing surplus copies.
 
-## Concurrency and resource tradeoffs
+Maintenance runs periodically (three-second configured interval), but recovery is not a hard three-second deadline. Network timeouts and unavailable capacity can delay work. If no valid copy is reachable, repair remains queued and a new read returns 503 before streaming begins.
 
-Per-object asyncio locks serialize lifecycle operations in one controller process. A single maintenance lock prevents overlapping passes. Worker filesystem operations run in a thread pool and use a worker lock to serialize manifest/data transitions. Metadata uses small synchronous SQLAlchemy transactions (no database transaction is held across worker HTTP calls); database stalls can block the event loop briefly, so connection/pool waits are bounded. This is acceptable for the local baseline, not high-throughput production architecture.
+## Integrity and durable repair
 
-Two simultaneous multipart uploads can each spool a complete incoming object to controller `/tmp`; this is disk spooling, not RAM buffering. A 50 MB free-space guard is checked during ingestion; actual write failures remain authoritative. Four downloads are admitted concurrently. Worker and controller network requests have finite concurrency. With roughly 5 GB available, use 100 MB routinely and 500 MB individually; do not retain many test objects. A 500 MB upload uses about 1 GB for two replicas plus source/spool and transient repair copies. Source generation in the demo uses one 1 MB block; downloads are hashed without saving another file.
+Workers check local chunk size, manifest, and SHA-256 on read. A background scan checks up to 16 cataloged chunks per pass against trusted expected values; scan cursor and cycle progress survive restart. A damaged file produces a durable event ID. Events are sent with heartbeats until the controller commits a deduplicated receipt and repair intent, then acknowledges them. Old reports cannot invalidate a newer replacement.
 
-This is a local teaching system. Full inventories and metadata/list responses are not optimized for millions of chunks, object-lock entries remain in process memory until restart, and long client streams can postpone deletion/repair for that object. No resumable/range downloads, user accounts, object versioning, content updates, or multipart-resume protocol are promised.
+Read failures, inventory findings, worker reports, and availability changes converge on one persistent repair job per chunk. A serial maintenance loop handles up to 32 jobs per pass. Jobs retain attempts and errors when a source or destination is unavailable. A repair checks that its object and revision are still current before publishing or trimming replicas. Deletion and repair share the object lock.
 
-## Acceptance checklist and evidence mapping
+Mutations use increasing operation sequences stored by both controller and worker. Workers reject stale or conflicting requests, retain completion receipts for retries, and finish interrupted publication or deletion on startup. Permanent deletion markers remain authoritative even if a later PUT arrives.
 
-| Requirement | Verification |
-|---|---|
-| Arbitrary bytes and original reconstruction | Binary boundary tests and SHA-256 round trips; 100/500 MB demo |
-| Decimal chunk size and final partial chunk | 0, 1, C−1, C, C+1, 2C, 2C+1 and 2.5 MB tests (C = 1,000,000 bytes) |
-| Two distinct replicas and worker distribution | Metadata assertions and demo checks across four workers |
-| Metadata without re-upload | PATCH tests preserve object checksum; concurrent updates merge |
-| Worker stop/restart | Demo uses `docker stop worker2` / `docker start worker2`; tests check repair and surplus cleanup |
-| Corruption detection/recovery | Corrupt a demo chunk; verify download and actual repaired disk copies; tests also corrupt manifests |
-| No valid replicas | 503 test for corruption of both copies |
-| Persistent storage | Worker disk reopen test and live controller restart in fault demo |
-| Interrupted upload and ambiguous replies | Cancellation, startup cleanup, lost-PUT-ack tests |
-| Offline deletion | Retain cleanup across recovery, then remove data after worker returns |
-| Storage unavailable | One-worker upload rejection and simulated ENOSPC tests |
-| REST validation and retries | Invalid metadata/UUID/registration, PUT conflict, repeat DELETE tests |
+## Upload idempotency
 
-Run commands are in README.md. Automated tests and the guided demonstration provide executable verification.
+`POST /api/v1/objects` accepts an optional `Idempotency-Key` header of 1–128 ASCII letters, digits, dots, underscores, colons, or hyphens. The key is case-sensitive and scoped to this controller deployment. The fingerprint covers normalized filename, content type, custom metadata, exact size, and file SHA-256.
 
-## Worker membership contract
+The first successful keyed upload returns 201 with `Idempotency-Replayed: false`. An identical retry returns the saved original response and object ID with `Idempotency-Replayed: true`, without rewriting workers. A changed request returns 409; a matching retry after deletion returns 410. A failed unpublished attempt can retry with the same key and payload. Receipts persist through controller restarts and remain after object deletion. They do not expire or provide resumable transfer: a retry resends the full file.
 
-The selected design follows TEAM-PLAN cards A2/B3/A5: stable storage identity, fresh boot identity, inventory before eligibility, and safe excess-copy reconciliation. PostgreSQL and the existing service boundary remain in use.
+## Concurrency and resource limits
 
-`worker.identity` is atomically persisted and fsynced separately from chunk manifests; it binds the volume to the configured service name. Each app process gets a fresh boot UUID. Corrupt identity files fail startup instead of silently generating a replacement. Migration 0002 preserves existing objects and replica rows, adds membership fields, and makes legacy workers/replicas ineligible/pending until registration and inventory finish. Legacy worker volumes create their first storage UUID during upgrade.
+Per-object asyncio locks serialize lifecycle changes within the single controller process. A maintenance lock prevents overlapping passes. The controller admits two simultaneous uploads and four downloads. It uses bounded network timeouts and a 50 MB free-space guard during upload spooling. Synchronous metadata transactions are short and do not span worker HTTP requests, but database stalls can briefly block the event loop.
 
-Registration probes the configured worker health endpoint to reject delayed reports from an old boot. A different volume UUID for an already bound service is rejected and disables eligibility; automated volume replacement is unsupported. Registration or heartbeat expiry advances a durable membership version and invalidates replica health. Heartbeats from a different boot must register. Maintenance retries reconciliation, checks object state under existing object locks, and only enables a worker when its boot and membership version still match. An inventory failure leaves it ineligible; database state survives controller restart. A final health probe detects a worker restart during inventory.
+Memory use is bounded by chunk buffers for transfers; metadata and full worker inventories still grow with chunk count. The demo defaults to 100 MB plus a partial final chunk and accepts smaller rehearsals with `--size-mb 2`. Available disk capacity is the practical object-size limit.
 
-Controller chunk requests carry expected storage/boot headers; workers reject a mismatched incarnation, and replies from a superseded membership version are discarded. These are membership guards; per-operation sequencing and durable write receipts are described below. Direct internal diagnostic calls may omit these headers on the trusted local Docker network.
+## Operational boundaries
 
-Worker readiness requires a recent successful controller report confirming eligibility; loss of contact clears readiness. Compose uses `/ready` for workers and `/health` for the controller, avoiding a startup dependency cycle. Inventory is currently a full list and one checksum pass under the worker disk lock, with bounded chunk reads but metadata memory proportional to local chunk count. Large inventories may require longer request timeouts; routine integrity scanning is separate, bounded, persisted and worker-local as described below. Exactly one worker process may own each volume, and one controller process owns lifecycle coordination.
+- One controller and one PostgreSQL instance are single points of failure. Two worker copies do not protect against losing both replicas or the physical host.
+- Authentication, authorization, TLS, backup automation, and Internet-facing deployment are outside this local project.
+- There is no object versioning, overwrite, range download, resumable upload, or distributed controller leader election.
+- Worker catalogs, operation receipts, and permanent deletion markers are retained. Restore PostgreSQL metadata and worker volumes together; restoring an older controller database against newer worker sequence records is unsupported.
+- A long client download can delay deletion and repair for that object. Full inventories and metadata responses are not optimized for millions of chunks.
 
-## Durable integrity and repair
+## Verification
 
-This follows TEAM-PLAN B2/B4/A5: a worker catalog with receipts, fixed-order local scans with persistent progress, retained/repeated damage reports, and a serial coalesced repair queue. Python's standard-library SQLite is added for worker-local relational state; PostgreSQL remains the authoritative object/membership database. No broker or additional container is introduced.
-
-### Worker persistence and operation ordering
-
-`catalog.sqlite` contains `chunks` (immutable expected hash/size, publication state and latest sequence), `operations` (latest sequence/signature/state/receipt per chunk), `damage` (one retained event per chunk/operation), and singleton `scan` progress. Transactions use SQLite `synchronous=FULL` and connections are closed per operation. Chunk files/manifests still use atomic rename and fsync. Local catalog corruption is a storage error, not permission to relearn expected hashes from data.
-
-Controller migration 0003 adds a singleton `operation_clock`, latest `worker_operations` per worker/chunk, `repair_jobs`, `damage_receipts` and reported worker scan progress. Legacy workers become ineligible until authoritative expectations have been seeded through reconciliation, in batches of at most 100 entries. Expected values cannot change an existing catalog hash/size, and expectations older than a worker mutation are rejected.
-
-Before each PUT/DELETE logical attempt the controller atomically allocates an increasing sequence and records its intent. Transport retries reuse that sequence. Worker requests use `X-Operation-Sequence`, in addition to storage/boot targeting. Before file changes, the worker commits sequence/signature/pending state; older sequences and same-sequence conflicting operations receive 409. A completed retry returns the stored receipt. Successful PUT acknowledgments are followed by an independent GET/hash/size check before a placement becomes healthy. Unsequenced internal mutations use sequence zero and cannot override a previously sequenced mutation; direct disk methods remain low-level local/test helpers.
-
-After an interrupted PUT, startup completes publication only if the bounded staged/final file matches the operation's recorded expectation; otherwise it retains pending intent and reports damage. Interrupted DELETE is replayed before serving requests. A permanent tombstone is persisted before unlinking files and rejects even newer PUT sequences. On controller restart, durable queue/replica/object records drive retry or cleanup; new logical attempts supersede old mutation sequences, while inventory can resolve a valid pending PUT. Binary payloads are not stored in either database.
-
-### Local scans and acknowledged reports
-
-Every worker scans up to 16 active catalog records in UUID order, then sleeps `SCAN_INTERVAL` (default 3 seconds). It persists a cycle ceiling at the start of a sweep and advances the cursor after recording each check/report. Newly arriving IDs cannot indefinitely extend the current cycle. The cursor, ceiling, cumulative checked count and completed cycles survive restart. Missing files, invalid manifests and changed bytes are checked against the trusted catalog, including the case where bytes and manifest were changed consistently. Removed/deleted placements are excluded.
-
-A damage event records chunk ID, operation sequence, reason and generated event UUID. Up to 100 retained events accompany each registration/heartbeat. The controller transaction deduplicates the event, checks its operation sequence against current placement intent, marks a current replica bad and enqueues/increments its repair revision. Only after commit does it return `acknowledged_damage`; the worker removes only those event IDs. Lost acknowledgments and restarts cause safe redelivery. Obsolete reports are acknowledged without damaging replacement health. Unrepaired corruption can generate a new event after acknowledgment on a subsequent scan.
-
-### Serial repair and current-intent validation
-
-`repair_jobs` has one row per chunk: revision, reason, attempts, last error and last-update timestamp. Read failures, inventory, local reports and metadata availability checks coalesce into these rows. Maintenance no longer periodically downloads healthy chunks for integrity scanning. An explicit `full_scrub=True` test/administrative call can enqueue all chunks for verification.
-
-One maintenance loop processes up to 32 queued jobs in timestamp order under the existing object lock. Busy and unresolved jobs are rotated to avoid starving later jobs. The loop reads verified source bytes, chooses another eligible destination, verifies the replacement and retains the job if source/capacity/worker availability is insufficient. Network failures do not establish corruption. Each job's captured revision and object lifecycle are checked before mutation and before publishing healthy placements or trimming extras; a newer report leaves the newer intent pending. Deletion shares the object lock, retains durable cleanup and cascades queue removal when a chunk is finally removed. Jobs persist through cancellation/restart and exceptions record a retryable error.
-
-Operational views: controller status includes last reported per-worker scan progress and the first 100 repair jobs; worker `/internal/scan` includes progress and the first 100 outstanding events. These views are snapshots, not atomic cluster-wide integrity proofs. Metadata scans still scale with chunk count, and rejoin inventory remains a full checksum pass; ordinary integrity scans are local and bounded.
-
-No automatic receipt/high-water/tombstone garbage collection is implemented. Restoring an old metadata database independently of worker catalogs can roll back controller sequencing and is unsupported; preserve both together. Single-controller/single-process-per-volume and trusted internal-network assumptions remain. These mechanisms protect ordering and recovery, not loss of both replicas or physical-host loss.
-
-## Operational client and verification
-
-`object_store.cli` provides upload, verified download, paginated list, metadata, PATCH, DELETE, status, placement, scan and repair inspection. The executable `store` launcher preserves the caller's working directory and chooses the project virtual environment when available. The client uses existing HTTPX plus standard-library argparse; no new dependency or service is needed. Output uses simple aligned columns; JSON mode supports scripts.
-
-Downloads stream to an adjacent temporary file, verify exact metadata size/SHA-256, fsync file contents and publish atomically. Default publication refuses an existing destination, including a concurrent creation; explicit --force replaces only after verification. Failed/cancelled transfers remove temporary files. Uploads stream multipart content and are not automatically retried. Optional public upload idempotency is implemented as described below.
-
-Unit/integration boundary cases cover 0, 1, C−1, C, C+1, 2C, 2C+1 and 2.5 MB. The guided presentation uses a multi-chunk binary object with a partial final chunk; exhaustive boundary cases remain in the automated suite. CLI tests cover HTTP contracts, pagination, read-only inspection, JSON/errors, metadata parsing, control-character sanitization, verified downloads, overwrite protection and interrupted/corrupt transfers. `final_demo/demo.py` presents the live system and includes operational CLI metadata inspection. The CLI launcher and automated tests are included with the project.
-
-## Upload idempotency contract
-
-POST /api/v1/objects accepts one optional `Idempotency-Key` header matching `[A-Za-z0-9._:-]{1,128}`. Keys are globally scoped and case-sensitive in this single-controller local service. Without a key, existing independent-upload behavior remains unchanged.
-
-Migration 0004 adds `upload_receipts`: key primary key, versioned SHA-256 request fingerprint, unique object ID, pending/completed/failed state, original response JSON and creation timestamp. Object ID deliberately has no foreign key: completed receipts must survive object deletion. No expiry or recycling is performed.
-
-The request fingerprint includes normalized stored filename, effective content type, canonical sorted custom metadata, exact file size and SHA-256 of its bytes. Metadata key order and multipart boundaries do not affect identity. The parser already spools uploaded bytes; keyed requests read this spool in 1 MB blocks and rewind it. The final stored-byte digest is compared with the precomputed fingerprint before publication, detecting an altered spool. This adds a complete bounded-memory disk-reading pass, not another full in-memory file or resumable transfer.
-
-A per-key asyncio lock serializes matching requests in the supported single-controller process. Receipt claim and invisible object creation share a transaction; existing rows are locked during claims and a unique key constraint guards initial-claim races. In-progress claims return 409 if they cannot be safely retried. Completed requests are replayed before worker availability checks: replay requires metadata access, not new worker writes. The response snapshot and transition to available/completed commit in the same database transaction, under the object's existing lifecycle lock. The response therefore cannot be successfully published without its receipt. A commit acknowledgment failure does not demote an already available object or completed receipt.
-
-Matching successful retries return 201 and the saved original JSON with `Idempotency-Replayed: true`; a first keyed success uses false. Different request fingerprints return 409. Matching retries for deleting or physically removed objects return 410 and never recreate data. Replaying a saved response does not reflect later PATCH or repair state; current metadata remains available separately.
-
-Failures/cancellation mark an unpublished attempt deleting and its receipt failed. The same key/fingerprint may start a new attempt with a new object ID while old partial data is cleaned up; it cannot create a second visible success. Startup marks pending receipts failed along with retiring abandoned uploading objects. If cleanup marking was temporarily unavailable, an existing pending/uploading claim remains a 409 until recovery resolves it. Completed receipts remain unchanged. No multi-controller/HA guarantee is added beyond the existing single-controller deployment.
-
-CLI uploads expose --idempotency-key and never silently generate keys or automatically retry requests. The live idempotency verifier checks API/CLI replay, conflict rejection, controller restart persistence, byte integrity and receipt retention after physical deletion.
+The automated suite in `tests/` covers chunk-size boundaries, REST contracts, membership, failures, corruption, lifecycle races, CLI behavior, and idempotency. Run it in Linux with `python -m pytest -q`. The guided `final_demo/demo.py` verifies the six-container deployment, physical replicas, worker stop/restart, corruption detection and repair, controller restart, and cleanup against the live Compose stack. See the [README demonstration steps](../README.md#run-the-demonstration).

@@ -1,27 +1,50 @@
-# Operational CLI
+# Command-line client
 
-Run `./store` from the project directory. The launcher uses the project's `.venv` when present, otherwise `python3`. Install `requirements.txt` first. You can also use `.venv/bin/python -m object_store.cli` (including when a ZIP extractor does not preserve executable permissions).
+The `store` client provides object operations and read-only cluster inspection. Start the [Docker deployment](../README.md#quick-start) before using it. All commands call the controller API; clients never connect directly to worker volumes.
 
-Output uses plain headings and aligned columns, with no box borders, banners or color dependency. Download progress appears only on an interactive terminal. Transfer summaries include elapsed time. Filenames and metadata are sanitized for human terminal output; JSON preserves the actual values with escaped control characters.
+## Run the client
 
-## Object operations
+From the repository root on Linux or macOS:
 
 ```bash
-./store upload './files/report.pdf' --meta owner=student --meta project=cloud
+./store --help
+```
+
+The shell launcher uses `.venv/bin/python` if present, then falls back to `python3`. If the launcher is not executable, run `.venv/bin/python -m object_store.cli`. On Windows PowerShell, use:
+
+```powershell
+.\.venv\Scripts\python.exe -m object_store.cli --help
+```
+
+The examples below use `./store`. Replace it with the Python module command on Windows. Create the virtual environment and install `requirements-dev.txt` as shown in the README.
+
+## Object commands
+
+| Command | Purpose |
+| --- | --- |
+| `upload FILE` | Upload binary data and optional custom metadata |
+| `list` | List stored objects |
+| `metadata ID` | Show object, chunk, and replica metadata |
+| `placements ID` | Show chunk locations and replica health |
+| `download ID -o FILE` | Download and verify an object |
+| `patch ID --meta KEY=VALUE` | Add or replace custom metadata |
+| `delete ID` | Remove an object from the public API |
+
+```bash
+./store upload report.pdf --meta owner=student --meta course=cloud
 ./store list
-./store list --all --limit 100
 ./store metadata OBJECT_ID
 ./store placements OBJECT_ID
-./store patch OBJECT_ID --meta owner=updated --meta 'note=reviewed locally'
-./store download OBJECT_ID --output './downloads/report.pdf'
+./store download OBJECT_ID -o downloaded.pdf
+./store patch OBJECT_ID --meta owner=updated
 ./store delete OBJECT_ID
 ```
 
-Replace `OBJECT_ID` with the UUID printed by upload. Upload infers a MIME type from the filename; `--type application/octet-stream` overrides it. Repeat `--meta KEY=VALUE` for additional fields; values may contain `=`. PATCH merges custom fields without altering file bytes. Delete immediately removes public visibility; physical cleanup may wait for an offline worker.
+Replace `OBJECT_ID` with the UUID returned by upload. Repeat `--meta KEY=VALUE` for multiple fields; values may contain `=`. Upload infers a content type from the filename, and `--type` overrides it. PATCH merges custom fields without changing stored bytes. DELETE makes the object unavailable immediately after its logical deletion commits; cleanup of an offline worker may finish later.
 
-Listing returns up to 100 objects by default. Use `--limit 1–1000`, `--offset N`, or `--all` to fetch subsequent pages. Pagination is a live view, not a transactional snapshot during concurrent additions/deletions.
+The default `list` page contains up to 100 objects. Use `--limit 1..1000`, `--offset N`, or `--all` for pagination. A multi-page list is a live view, so concurrent changes can alter later pages.
 
-## Inspection
+## Cluster inspection
 
 ```bash
 ./store status
@@ -30,34 +53,41 @@ Listing returns up to 100 objects by default. Use `--limit 1–1000`, `--offset 
 ./store placements OBJECT_ID
 ```
 
-`status` shows worker availability, membership, free space, heartbeat timestamps, replication factor and pending cleanup. `scans` shows the last reported completed cycles, checked records, pending damage and cursor per worker. `repairs` shows up to 100 pending jobs with reason, attempts, revision and last error. An empty repair queue does not guarantee every file was checked at that instant. `placements` shows each recorded chunk/worker pair and its health/availability.
+| Command | What it shows |
+| --- | --- |
+| `status` | Worker availability, membership, free space, last heartbeat, replication target, and pending cleanup |
+| `scans` | Last reported integrity-scan progress and pending damage count per worker |
+| `repairs` | Up to 100 queued repair jobs, with reason, revision, attempts, and last error |
+| `placements` | Each recorded chunk/worker pair with replica state and availability |
 
-Example output structure:
+These are status snapshots. A `healthy` replica is last known to be valid; reads and scans provide fresh checksum checks. An empty repair queue does not prove every stored file was checked at that instant.
 
-```text
-Cluster · 4/4 workers available
+## Download verification
 
-Worker   Availability  Membership  Free space  Last heartbeat
-worker1  ready         ready       ...         ...
-worker2  ready         ready       ...         ...
-worker3  ready         ready       ...         ...
-worker4  ready         ready       ...         ...
-
-Replication  2 copies
-Pending cleanup  0 objects
-```
-
-## Download safety
-
-Downloads stream to a temporary file beside the destination. The client checks exact size and SHA-256 against object metadata before publishing it. Corrupt or interrupted transfers remove the temporary file and leave an existing destination untouched. Existing files require explicit `--force`; without it, publication also refuses a destination created by another process during the download.
+The client streams a download into a temporary file beside the destination. It checks the exact byte count and SHA-256 against object metadata before publishing the file. A failed or interrupted transfer removes the temporary file. Existing destinations are preserved unless `--force` is given; the client also refuses a destination created by another process during an ordinary download.
 
 ```bash
-./store download OBJECT_ID -o report.pdf --force
+./store download OBJECT_ID -o ./downloads/report.pdf
+./store download OBJECT_ID -o ./downloads/report.pdf --force
 ```
 
-The destination directory must already exist. The client needs temporary disk space for the complete download. Uploads stream from the input file through HTTPX multipart encoding. Upload POSTs are not automatically retried. Supply `--idempotency-key YOUR_UNIQUE_KEY` and reuse that key with the identical file/name/type/metadata when retrying an ambiguous response. Without a key, inspect `list` before retrying because another complete object could be created.
+The destination directory must already exist and have enough space for the full object. The server sends `Content-Length` and `X-Object-Checksum`, but a stream can end after HTTP headers have been sent; use the verified CLI or check length and checksum in another client.
 
-## Configuration and automation
+## Safe upload retries
+
+An upload is not retried automatically. If the response is lost, retry with the same explicit idempotency key and identical file, name, content type, and metadata:
+
+```bash
+./store upload report.pdf --meta owner=student --idempotency-key report-001
+# If the response is lost, repeat the same command:
+./store upload report.pdf --meta owner=student --idempotency-key report-001
+```
+
+The controller returns the original object ID and saved 201 response on a matching retry, including after a controller restart. Changed request data with the same key returns 409. A matching retry after the object was deleted returns 410; use a new key for a new intended object. Keys are case-sensitive, 1–128 characters, and may contain ASCII letters, digits, `.`, `_`, `:`, or `-`. They are retained without expiry in this local system. Retries resend the complete file; this is not resumable upload.
+
+Replayed responses reflect creation-time metadata. Use `metadata`, `placements`, or `status` for current state.
+
+## Configuration and scripts
 
 ```bash
 ./store --url http://127.0.0.1:8000 status
@@ -66,27 +96,12 @@ STORE_URL=http://127.0.0.1:8000 ./store status
 ./store list --all --json
 ```
 
-Global options work before or after the command. `--url` overrides `STORE_URL`; the default is `http://127.0.0.1:8000`. Network inactivity timeout defaults to 300 seconds, with connection establishment limited to at most five seconds; `--timeout` overrides it. This is not a total transfer deadline.
+Global options may appear before or after the command. `--url` overrides `STORE_URL`; the default URL is `http://127.0.0.1:8000`. `--timeout` is an inactivity timeout in seconds, not a total transfer deadline; connection setup is capped at five seconds. `--json` writes machine-readable JSON to stdout. Errors go to stderr with exit code 1, invalid arguments use 2, cancellation uses 130, and success uses 0. Run `./store COMMAND --help` for command-specific options.
 
-`--json` writes only a JSON result to stdout. Inspection commands return the raw controller status snapshot. Errors use stderr and exit code 1; argument errors use 2; cancellation uses 130. Normal success returns 0. There are no automatic mutation retries and no interactive confirmations. `./store COMMAND --help` lists that command's options.
-
-## Verification
+## Verify the client
 
 ```bash
-.venv/bin/pytest -q tests/test_cli.py
-.venv/bin/python final_demo/demo.py
+python -m pytest -q tests/test_cli.py
 ```
 
-The guided demo includes live CLI metadata inspection alongside API and physical-storage checks. It intentionally interrupts services and corrupts only its own data. Full CLI command/error coverage remains in the automated tests.
-
-## Upload idempotency keys
-
-```bash
-./store upload report.pdf --meta owner=student --idempotency-key report-001
-# If the reply is lost, run the identical command again.
-./store upload report.pdf --meta owner=student --idempotency-key report-001
-```
-
-The retry returns the same object ID and saved original response, even after controller restart. Use a new key for a different intended object. A key is case-sensitive and contains 1–128 ASCII letters/digits, dots, underscores, colons or hyphens. Changed bytes, filename, content type or custom metadata with the same key produce 409. Matching retries after deletion produce 410. Keys and completed receipts are retained; there is no expiry/recycling. Failed unpublished attempts may retry with the same payload/key, and an in-progress 409 can be retried later.
-
-The saved response is a creation-time snapshot, so later PATCH/repair activity does not alter it. Use `metadata`, `placements` or `status` for current state. The whole upload is resent on retry; no resumable-transfer protocol or automatic retry loop is implied.
+Run tests in Linux or a Linux container. The [guided demo](../README.md#run-the-demonstration) also exercises live CLI metadata inspection alongside API and physical-storage checks.

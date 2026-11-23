@@ -1,29 +1,48 @@
 # Mini Distributed Cloud Object Store
 
-Python REST backend for one controller and four persistent storage workers, using PostgreSQL metadata and Docker Compose. Objects are divided into decimal 1 MB chunks with two replicas on different workers. No frontend or cloud account is needed.
+A local distributed object store built with Python, FastAPI, PostgreSQL, and Docker Compose. One controller coordinates four persistent storage workers. Files are split into 1,000,000-byte chunks, with two copies of every chunk placed on different workers.
 
-## Command-line client
+The project includes a REST API, command-line client, automated tests, and a guided demonstration of worker failure and data corruption. It is designed for a single-host coursework deployment.
 
-Use `./store` for a clean terminal interface (the launcher uses your project `.venv`):
+## At a glance
 
-```bash
-./store upload report.pdf --meta owner=student --idempotency-key report-upload-001
-./store list
-./store metadata OBJECT_ID
-./store placements OBJECT_ID
-./store download OBJECT_ID -o downloaded.pdf
-./store patch OBJECT_ID --meta owner=updated
-./store status
-./store scans
-./store repairs
-./store delete OBJECT_ID
+| | Implementation |
+| --- | --- |
+| Topology | 1 controller, 4 workers, 1 PostgreSQL service |
+| Object data | Arbitrary binary files in persistent worker volumes |
+| Metadata | PostgreSQL records plus custom string key-value pairs |
+| Chunking | 1,000,000 bytes per chunk; final chunk may be smaller |
+| Replication | 2 checksum-verified copies on distinct workers |
+| Recovery | Heartbeats, reconciliation, durable repair jobs, local integrity scans |
+| Client access | REST API and `store` CLI |
+
+```mermaid
+flowchart LR
+    Client[CLI or REST client] --> Controller[FastAPI controller]
+    Controller --> DB[(PostgreSQL metadata)]
+    Controller --> W1[Worker 1]
+    Controller --> W2[Worker 2]
+    Controller --> W3[Worker 3]
+    Controller --> W4[Worker 4]
+    W1 --> V1[(Volume 1)]
+    W2 --> V2[(Volume 2)]
+    W3 --> V3[(Volume 3)]
+    W4 --> V4[(Volume 4)]
 ```
 
-Downloads are size/SHA-256 verified before saving the final file. Existing destinations require `--force`. Add `--json` for scripts, `--url` for another controller, or `--help` for command options. See [docs/cli.md](docs/cli.md) for the complete guide.
+The controller is the only client-facing service. Worker and database ports stay inside the Compose network. See [the design document](docs/design.md) for the storage model and recovery protocol.
 
-## Start
+## Requirements
 
-Prerequisites: Docker Engine with Compose; Python 3.12+ for local tests/demo.
+- Docker Engine with Docker Compose.
+- Python 3.12 or newer for the local CLI, tests, and guided demo.
+- A free localhost port 8000 and unused container names `worker1` through `worker4`.
+
+The service and tests target Linux containers. The shell launcher `./store` targets Unix-like shells; Windows commands are shown below.
+
+## Quick start
+
+From the repository root:
 
 ```bash
 docker compose up -d --build --wait
@@ -31,117 +50,109 @@ docker compose ps
 curl http://127.0.0.1:8000/api/v1/status
 ```
 
-Wait for all four workers to appear as available. The API is at http://127.0.0.1:8000 and generated API documentation at http://127.0.0.1:8000/docs. PostgreSQL migrations run automatically before the controller starts. Port 8000 and container names worker1..worker4 must be free.
+The first command builds the image, runs database migrations, and starts all six services. Wait until the controller and four workers are healthy. The API is at `http://127.0.0.1:8000`; interactive API documentation is at `http://127.0.0.1:8000/docs`.
 
-Six containers run locally. Each worker has a separate named volume; PostgreSQL and upload spool storage also have volumes. Worker and database ports are not published. These are local-development credentials/network settings, not an Internet deployment.
-
-## Guided demonstration
-
-Start Docker Compose first, then run the single presentation client:
+Install the local client and demo dependencies:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python final_demo/demo.py
-# Same checks without presentation pauses:
-.venv/bin/python final_demo/demo.py --unattended
+.venv/bin/python -m pip install -r requirements-dev.txt
 ```
 
-The opening checklist is printed once. Seven stages cover deployment, binary round-trip,
-chunk order/distribution and physical replicas, metadata/list/errors, worker failure and
-offline deletion, proactive corruption detection/report delivery/repair, restart-safe
-upload idempotency, and final deletion. Stages pause for Enter; Docker fault commands
-run automatically and are announced. Use a second terminal for logs or inspection,
-not simultaneous fault injection. The operational CLI is shown during metadata inspection.
+On Windows PowerShell:
 
-The default main object is 100 MB plus a 19-byte final chunk. `--size-mb 2` provides a
-quick rehearsal; values up to 500 are supported. Downloads are streamed and hashed.
-The script uses the local controller at port 8000 and the current repository's Compose
-services. Run on an otherwise idle local deployment: service interruptions affect the
-whole cluster, although only this run's objects are corrupted/deleted. It restores
-containers and removes its data even after an error or Ctrl+C, reports cleanup failures,
-and exits nonzero on failure. No Docker volumes are removed.
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+$env:PYTHONIOENCODING = 'utf-8'
+```
 
-## Use the API
+The UTF-8 setting lets the guided demo print its Unicode status symbols in a Windows terminal. The server itself runs in Linux containers.
+
+## Try the client
+
+```bash
+./store upload report.pdf --meta owner=student --idempotency-key report-001
+./store list
+./store metadata OBJECT_ID
+./store placements OBJECT_ID
+./store download OBJECT_ID -o downloaded.pdf
+./store patch OBJECT_ID --meta owner=updated
+./store status
+./store delete OBJECT_ID
+```
+
+Replace `OBJECT_ID` with the UUID returned by upload. On Windows, replace `./store` with `.\.venv\Scripts\python.exe -m object_store.cli`. Downloads are checked against the stored size and SHA-256 before the destination file is published. Use `--force` only when you intend to replace an existing destination.
+
+See [the CLI guide](docs/cli.md) for every command, JSON output, inspection tools, and safe retry behavior.
+
+## Client API
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/v1/objects` | Upload multipart `file` and optional JSON `metadata`; returns 201 |
+| `GET` | `/api/v1/objects/{object_id}` | Download the original binary object |
+| `GET` | `/api/v1/objects/{object_id}/metadata` | Read system and custom metadata |
+| `PATCH` | `/api/v1/objects/{object_id}/metadata` | Merge custom metadata without re-uploading |
+| `DELETE` | `/api/v1/objects/{object_id}` | Remove public visibility; returns 204 |
+| `GET` | `/api/v1/objects` | List objects with `offset` and `limit` |
+| `GET` | `/api/v1/status` | Inspect workers, scan progress, cleanup, and repairs |
+
+Upload example:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/api/v1/objects \
-  -F 'file=@/path/to/file.bin;type=application/octet-stream' \
-  -F 'metadata={"course":"cloud","owner":"student"}'
+  -F 'file=@report.pdf;type=application/pdf' \
+  -F 'metadata={"owner":"student","course":"cloud"}'
 ```
 
-Copy `object_id` from the response and substitute it below:
+The response includes the object ID, whole-object checksum, ordered chunks, and replica locations. API errors use a JSON `error.message`. The optional `Idempotency-Key` header makes a retry of the *same* upload return the original 201 result. A different payload with the same key returns 409; a matching retry after deletion returns 410.
+
+## Run the demonstration
+
+Start the services first, then run:
 
 ```bash
-OBJECT_ID='replace-with-returned-uuid'
-curl -sS http://127.0.0.1:8000/api/v1/objects
-curl -sS "http://127.0.0.1:8000/api/v1/objects/$OBJECT_ID/metadata"
-curl -sS -X PATCH "http://127.0.0.1:8000/api/v1/objects/$OBJECT_ID/metadata" \
-  -H 'Content-Type: application/json' -d '{"owner":"updated"}'
-curl --fail -o downloaded.bin "http://127.0.0.1:8000/api/v1/objects/$OBJECT_ID"
-sha256sum downloaded.bin
-curl -i -X DELETE "http://127.0.0.1:8000/api/v1/objects/$OBJECT_ID"
+.venv/bin/python final_demo/demo.py
 ```
 
-Compare `sha256sum` to the metadata's whole-object checksum. Metadata also shows chunk ordering, size, checksum, worker locations, last-known replica state, and heartbeat availability. DELETE returns 204 after logical deletion; physical cleanup can continue while a worker is offline. PATCH accepts only custom string key-value pairs.
+The demo pauses between seven stages. It verifies the six-container deployment, binary round trip, chunk distribution and physical copies, metadata, worker stop/restart, intentional corruption and repair, upload replay across a controller restart, and final cleanup. It announces each fault command before running it and restores the affected services. Its default object is 100 MB plus a 19-byte final chunk.
 
-## Automated tests
+For a quick unattended rehearsal:
 
 ```bash
-.venv/bin/python -m pytest -q
+.venv/bin/python final_demo/demo.py --unattended --size-mb 2
 ```
 
-These tests retain chunk boundaries, stale operations, interrupted writes, concurrency,
-worker membership, integrity, lifecycle, CLI and upload-idempotency coverage independently
-of the presentation.
+On Windows PowerShell, run `.\.venv\Scripts\python.exe final_demo\demo.py --unattended --size-mb 2` after setting `PYTHONIOENCODING` as shown above. Run the demo on an otherwise idle local cluster: stopping a worker or the controller temporarily affects all objects, although the demo only corrupts and deletes its own test data.
 
-## Stop and restart
+## Tests
+
+Run the automated suite in Linux, where the worker's durable filesystem operations are supported:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+The suite covers chunk boundaries, API behavior, worker membership, concurrent lifecycle operations, interrupted writes, integrity scanning, repair, CLI behavior, and upload idempotency. A native Windows run is not supported because the worker uses Linux directory `fsync` semantics. Docker is the intended runtime.
+
+On Windows PowerShell, run the suite inside the built Linux image:
+
+```powershell
+$repo = (Get-Location).Path
+docker run --rm -v "${repo}:/app" -w /app mini-object-store:local sh -c 'pip install -q -r requirements-dev.txt && pytest -q'
+```
+
+## Stop and retain data
 
 ```bash
 docker compose stop
 docker compose start
-# Or remove containers/network while retaining named volumes:
-docker compose down
-docker compose up -d --wait
 ```
 
-`docker compose down -v` permanently deletes all project volumes and stored data; it is not needed for normal shutdown. No reset/volume deletion is part of the demonstration.
+`docker compose down` removes containers and the network while retaining named volumes. A later `docker compose up -d --wait` reuses the stored data. `docker compose down -v` deletes the volumes and stored objects permanently.
 
-## Design and boundaries
+## Scope and limitations
 
-See [design.md](docs/design.md) for the architecture, schema, REST contracts, state transitions, recovery policies, and acceptance criteria.
-
-- One controller process only. Do not add Uvicorn workers or controller replicas: lifecycle locks are intentionally process-local.
-- Replication protects against a worker process failure; a single-host system cannot tolerate loss of its physical disk or metadata database.
-- Checksums are verified before each chunk is returned. If all copies of a later chunk fail after download headers were sent, the stream terminates; clients must verify size/checksum.
-- Downloads already in progress hold an object lock; deletion waits for those downloads before committing logical removal.
-- PostgreSQL owns metadata; persistent filesystem volumes own binary data. No Kafka, gRPC, Kubernetes, or leader election is needed for this topology.
-- Authentication, TLS, high availability of the controller/database, backups, and resumable transfers are outside this local coursework implementation.
-
-## Durable integrity and repair
-
-Workers use Python's built-in SQLite module for a small `catalog.sqlite` file inside their existing data volume. PostgreSQL remains the controller database, and the deployment still has six containers. This adds durable local metadata, not another database service.
-
-- A fixed-order local scan checks up to 16 cataloged chunks per pass (default every 3 seconds). Its cursor, cycle ceiling, completed-cycle count and checked count survive restart. Checks use trusted expected size/hash from PUT or controller reconciliation, never a recomputed replacement hash.
-- Damage reports have durable event IDs and repeat in heartbeats until acknowledged. The controller commits deduplication and repair intent before acknowledgment; an old report cannot invalidate a newer replacement operation.
-- The controller coalesces read failures, availability changes, inventory findings and damage reports into one persistent repair job per chunk. One serial loop handles up to 32 jobs per pass, verifies replacement bytes and checks current object/repair intent before publication. Unresolved jobs retain attempts/error details and retry.
-- Mutations carry a durable increasing operation sequence. Workers record the sequence and intent before changing files, retain completion receipts, reject stale/conflicting requests, and recover interrupted publication/deletion on startup. Permanent deletion markers still forbid resurrection at any sequence.
-
-`GET /api/v1/status` includes each worker's last reported `scan_progress` and up to 100 pending `repair_jobs` (reason, revision, attempts and last error). Worker `GET /internal/scan` exposes local progress and up to 100 unacknowledged reports on the internal network. The CLI exposes these inspection APIs through `store status`, `store scans` and `store repairs`.
-
-Catalogs, operation high-water marks, deduplication receipts and permanent deletion markers are retained rather than garbage-collected. Back up controller metadata and worker volumes together; restoring an older controller database against newer worker sequence records is not supported. The system continues to require one controller process and one worker process per volume.
-
-## Retry uploads safely
-
-Choose a unique key for each intended object and reuse it if the response is lost:
-
-```bash
-./store upload report.pdf --meta owner=student --idempotency-key report-upload-001
-# Retry the identical command with the same key.
-```
-
-The API accepts the optional `Idempotency-Key` header on `POST /api/v1/objects`. Matching requests return the saved original 201 response and object ID, with `Idempotency-Replayed: true` on a replay (`false` on the first success). The key binds the file bytes, normalized filename, content type and custom metadata. Changed requests return 409. Matching retries after deletion return 410; use a new key to intentionally create another object.
-
-Keys are case-sensitive, globally scoped in this local service, and contain 1–128 ASCII letters/digits or `. _ : -` (without spaces). Receipts persist in PostgreSQL across controller restarts and are retained after object cleanup. A failed, unpublished attempt can retry with the same key and identical payload; its old partial data remains subject to cleanup. Requests still in progress can return 409 and should be retried later. Replays return the original response snapshot; use metadata/status APIs for current metadata and replica health.
-
-Uploads without a key remain independent. The CLI does not retry automatically or generate a key implicitly. Keyed retries resend the complete request, with a bounded extra hashing pass over the existing upload spool; this is not resumable upload. The guided demo verifies keyed replay, conflicts, controller-restart persistence and rejection after physical deletion.
+This deployment runs one controller process and one process per worker volume. Process-local locks and a single PostgreSQL instance are intentional. Worker replication does not protect against loss of the host, its disk, or the metadata database. Authentication, TLS, controller/database high availability, backups, and resumable transfers are not included. See [design and limitations](docs/design.md#operational-boundaries) for details.
